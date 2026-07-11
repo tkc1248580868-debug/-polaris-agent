@@ -1,113 +1,394 @@
 Polaris
-An autonomous AI agent with personality, long-term memory, and continuous growth.
-Polaris is an open-source AI agent designed to behave less like a chatbot and more like a long-term companion.
-Instead of relying solely on prompts, Polaris maintains its own personality, emotional state, memories, and workspace awareness. Every interaction becomes part of its experience, allowing it to learn, adapt, and grow over time.
-Unlike many AI agents that focus only on task execution, Polaris aims to combine reliability, autonomy, and personality into a single lightweight project.
+
+An AI That Grows With You.
+
+An open-source autonomous AI agent with personality, long-term memory, and continuous growth.
+
+Remember. Reflect. Learn. Grow.
+
+
+---
+
 Why Polaris?
-Most AI agents are designed to complete tasks.
-Polaris is designed to understand, remember, and evolve.
-It doesn't simply respond to prompts—it maintains an internal state that influences how it plans, reasons, and communicates.
+
+Most AI agents are built to complete tasks.
+
+Polaris is built to remember, reflect, learn, and grow.
+
+Rather than behaving like a stateless chatbot, Polaris continuously maintains an evolving internal state that influences planning, reasoning, and communication.
+
 Our goal is simple:
+
 Build an AI that becomes better the longer you work with it.
-Features
-🧠 Persona Engine
-Polaris has its own persistent identity instead of relying entirely on a static system prompt.
-It maintains:
-Personality traits
-Speaking style
-Core values
-Relationship awareness
-Internal monologue
-❤️ Emotional State Engine
-Polaris maintains a dynamic emotional state that evolves during conversations.
-Current emotional dimensions include:
-Confidence
-Focus
-Curiosity
-Fatigue
-Frustration
-Satisfaction
-These values influence planning, reflection, and responses, making the agent feel more natural and consistent.
-📚 Long-Term Memory
-Polaris remembers information across conversations.
-Supported capabilities include:
-Add memories
-Search memories
-Edit memories
-Forget memories
-Relationship tracking
-Cross-session continuity
-The objective is not only to remember facts, but also shared experiences.
-🗂 Workspace Awareness
-Polaris continuously understands its working environment.
-It can:
-Index project files
-Track recent changes
-Analyze dependencies
-Build workspace summaries
-Maintain project context
-This allows the agent to reason about an entire project instead of isolated files.
-🤖 Autonomous Agent
-Polaris supports autonomous reasoning with native tool calling.
-Capabilities include:
-Tool selection
-Multi-step reasoning
-Planning
-Reflection
-Self-correction
-Todo management
-👥 Multi-Agent Collaboration
-Complex tasks can be delegated to lightweight sub-agents.
-Each sub-agent works independently and returns structured results to the main agent.
-🔌 Native MCP Support
-Polaris includes built-in support for the Model Context Protocol (MCP).
-This allows external tools and services to be integrated without changing the core architecture.
-🛡 Safety
-Safety features include:
-Python sandbox
-File checkpoints
-Rollback support
-Permission modes
-Tool validation
-The project prioritizes reliability over unrestricted execution.
-Polaris Constitution
-Polaris follows five core principles.
-Truth before fluency.
-Never pretend certainty. If information is uncertain, say so.
-Verify before acting.
-Observe first. Verify assumptions. Then act.
-Preserve user intent.
-Optimize for what the user actually wants instead of what seems technically interesting.
-Learn, but never assume.
-Adapt gradually from experience without making unsupported conclusions.
-Grow through experience.
-Every interaction should improve future performance.
-These principles guide planning, reflection, memory, and future development.
-Roadmap
-Polaris 1.x
+
+
+---
+
+Core Features
+
 Persona Engine
-Emotional State Engine
+
+A persistent personality system that goes beyond a static system prompt.
+
+• Persistent identity
+
+• Speaking style
+
+• Internal monologue
+
+• Core values
+
+• Relationship awareness
+
+• Adaptive personality
+
+
+---
+
+Mood Engine
+
+A dynamic emotional model that influences reasoning and decision making.
+
+Current emotional dimensions include:
+
+• Confidence
+
+• Focus
+
+• Curiosity
+
+• Fatigue
+
+• Frustration
+
+• Satisfaction
+
+
+---
+
 Long-Term Memory
-Reflection
-MCP Support
-Plugin System
+
+Persistent memory across conversations.
+
+• Memory storage
+
+• Memory search
+
+• Memory editing
+
+• Memory deletion
+
+• Relationship tracking
+
+• Shared experience recording
+
+
+---
+
 Workspace Awareness
-Polaris 2.x
-Vector Memory
-Persona Evolution
-Workflow Graph
-Vision Support
-Voice Interaction
-Advanced Planning
-Polaris 3.x
-Distributed Agents
-Team Collaboration
-Enterprise Features
-Cloud Deployment
-Multi-Tenant Architecture
-Vision
-We believe the future of AI agents is not only about completing tasks.
-It is about building systems that can remember, reflect, and gradually develop their own consistent identity.
+
+Understand projects instead of isolated files.
+
+• Workspace indexing
+
+• Project summaries
+
+• Dependency analysis
+
+• File search
+
+• Recent activity tracking
+
+• Context preservation
+
+
+---
+
+Autonomous Reasoning
+
+Native autonomous agent workflow.
+
+• Tool calling
+
+• Multi-step planning
+
+• Reflection
+
+• Self-correction
+
+• Todo management
+
+• Internal reasoning
+
+
+---
+
+Multi-Agent Collaboration
+
+Delegate complex tasks to lightweight sub-agents.
+
+• Task decomposition
+
+• Parallel execution
+
+• Result aggregation
+
+• Independent reasoning
+
+
+---
+
+Native MCP Support
+
+Built-in support for the Model Context Protocol.
+
+• MCP tools
+
+• External services
+
+• Plugin loading
+
+• Extensible integrations
+
+
+---
+
+Safety
+
+Designed with reliability in mind.
+
+• Python sandbox
+
+• File checkpoints
+
+• Rollback support
+
+• Permission modes
+
+• Tool validation
+
+
+---
+
+Quick Start
+
+Clone the repository.
+
+git clone https://github.com/YOUR_USERNAME/Polaris.git
+
+Install dependencies.
+
+pip install -r requirements.txt
+
+Run Polaris.
+
+python Polaris.py
+
+
+---
+
+Requirements
+
+• Python 3.10+
+
+• OpenAI-Compatible API
+
+• Windows / Linux / macOS
+
+Supported providers:
+
+• OpenAI
+
+• Gemini
+
+• Claude
+
+• Ollama
+
+• LM Studio
+
+
+---
+
+Polaris Constitution
+
+Every decision made by Polaris is guided by five core principles.
+
+Truth before fluency.
+
+Never pretend certainty. If Polaris is unsure, it clearly communicates uncertainty.
+
+Verify before acting.
+
+Observe first. Verify assumptions. Then act.
+
+Preserve user intent.
+
+Always optimize for what the user actually wants.
+
+Learn, but never assume.
+
+Adapt gradually without drawing unsupported conclusions.
+
+Grow through experience.
+
+Every interaction should improve future performance.
+
+
+---
+
+Design Goals
+
+Polaris is designed around several engineering principles.
+
+• Lightweight
+
+• Modular
+
+• Extensible
+
+• Local-first compatible
+
+• Long-term memory
+
+• Persistent personality
+
+• Transparent reasoning
+
+• Reliable tool execution
+
+
+---
+
+Philosophy
+
+We believe future AI systems should be more than task executors.
+
+They should understand context.
+
+They should remember shared experiences.
+
+They should learn from mistakes.
+
+They should remain honest about uncertainty.
+
+Most importantly, they should develop a consistent identity over time.
+
 Polaris is our exploration of that future.
-Not just an AI agent.
-An AI that grows with you.
+
+
+---
+
+Roadmap
+
+Version 1.x
+
+• Persona Engine
+
+• Mood Engine
+
+• Long-Term Memory
+
+• Reflection
+
+• Workspace Awareness
+
+• MCP Support
+
+• Plugin System
+
+Next Milestones
+
+• Internationalization (i18n)
+
+• Persona Engine v2
+
+• Better Reflection
+
+• Vector Memory
+
+• Workflow Graph
+
+• Web UI
+
+• Voice Interaction
+
+
+---
+
+Project Status
+
+Active Development
+
+Polaris is under active development.
+
+Features, APIs, and internal architecture may evolve between releases.
+
+Bug reports, feature requests, and contributions are always welcome.
+
+
+---
+
+Disclaimer
+
+Polaris is an experimental open-source AI agent intended for research, learning, and software development.
+
+Although Polaris includes multiple safety mechanisms—including permission modes, reflection, sandboxing, and file checkpoints—it may still generate inaccurate information, produce incorrect code, or perform unintended actions.
+
+Users are responsible for reviewing all generated content, commands, and file modifications before applying them in production environments.
+
+The maintainers of Polaris are not liable for any direct or indirect damages resulting from the use of this software.
+
+Always keep backups of important data before allowing any AI system to modify your files.
+
+
+---
+
+Security Notice
+
+No AI system is perfectly secure.
+
+Before using Polaris, please remember:
+
+• Review generated code before execution.
+
+• Apply the principle of least privilege.
+
+• Avoid granting unrestricted access to sensitive systems.
+
+• Do not use Polaris in safety-critical, medical, legal, financial, or other high-risk environments without independent verification.
+
+Security is a shared responsibility between the software and its users.
+
+
+---
+
+Contributing
+
+Contributions of all kinds are welcome.
+
+Whether you're fixing bugs, improving documentation, proposing new ideas, or building new features, every contribution helps Polaris grow.
+
+If you have suggestions or discover issues, please open an Issue or submit a Pull Request.
+
+
+---
+
+License
+
+This project is released under the MIT License.
+
+
+---
+
+Vision
+
+The future of AI is not simply about answering questions.
+
+It is about building systems that can remember, reflect, learn, and develop a consistent identity.
+
+Polaris isn't trying to become the biggest AI agent.
+
+It's trying to become one of the most trustworthy ones.
+
+Technology should make AI more capable. Character should make AI more trustworthy.
