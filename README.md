@@ -1,74 +1,113 @@
-Polaris 1.0.0 Awakening | MiniAgent v5.3
-
-A personality-driven autonomous AI agent with long-term memory, emotional states, workspace awareness, and cross-session continuity.
-
-Polaris is the flagship persona of MiniAgent v5.3 - an AI companion that thinks, feels, remembers, and evolves alongside you.
-
+Polaris
+An autonomous AI agent with personality, long-term memory, and continuous growth.
+Polaris is an open-source AI agent designed to behave less like a chatbot and more like a long-term companion.
+Instead of relying solely on prompts, Polaris maintains its own personality, emotional state, memories, and workspace awareness. Every interaction becomes part of its experience, allowing it to learn, adapt, and grow over time.
+Unlike many AI agents that focus only on task execution, Polaris aims to combine reliability, autonomy, and personality into a single lightweight project.
+Why Polaris?
+Most AI agents are designed to complete tasks.
+Polaris is designed to understand, remember, and evolve.
+It doesn't simply respond to prompts—it maintains an internal state that influences how it plans, reasons, and communicates.
+Our goal is simple:
+Build an AI that becomes better the longer you work with it.
 Features
-- Independent persona system with values and speech style
-- Long-term memory (add, search, forget)
-- Realistic emotional engine (confidence, focus, fatigue, frustration, etc.)
-- Dynamic workspace model (files, dependencies, recent changes)
-- Cross-session memory and relationship tracking
-- Intelligent reasoning engine
-- Rich toolset: file operations, Python sandbox, shell commands, parallel sub-agents
-- MCP external tool support
-- Optional internal thought display
-- Extensive CLI commands
-
-Installation Guide
-
-1. Prerequisites
-   - Python 3.10 or higher
-   - pip install openai
-
-2. Setup
-   Place polaris_1_0_0_awakening.py in your project root directory.
-
-3. Running the Agent
-
-   With OpenAI:
-   OPENAI_API_KEY=sk-your-key-here python polaris_1_0_0_awakening.py
-
-   With Ollama:
-   MINIAGENT_BACKEND=ollama MINIAGENT_MODEL=deepseek-r1:32b python polaris_1_0_0_awakening.py
-
-   With LM Studio:
-   MINIAGENT_BACKEND=lmstudio OPENAI_BASE_URL=http://127.0.0.1:1234/v1 python polaris_1_0_0_awakening.py
-
-Environment Variables
-- OPENAI_API_KEY: Your API key
-- OPENAI_BASE_URL: Custom base URL for local models
-- MINIAGENT_MODEL: Model name (default: gpt-4o)
-- MINIAGENT_BACKEND: Backend type (openai, ollama, lmstudio)
-
-Quick Start
-1. Run the script in your project folder
-2. Type /init to generate AGENT.md
-3. Type /state to view system overview
-4. Chat naturally or assign tasks
-
-Common Commands (start with /)
-- /state          Full system status (recommended)
-- /mood           Emotional state
-- /workspace      Project world model
-- /experience     Shared history
-- /memory         Long-term memories
-- /undo           Rollback last file change
-- /init           Create AGENT.md guidelines
-- /thought on/off Toggle thinking monologue
-
-Project Files
-- polaris_1_0_0_awakening.py     Main program
-- agent_memory.json              Long-term memory
-- agent_mood.json                Mood state
-- agent_persona.json             Persona profile
-- agent_relationship.json        User relationship
-- agent_conversations.jsonl      Conversation archive
-- .miniagent_checkpoints/        File modification backups
-- AGENT.md                       Project guidelines (recommended)
-
-Disclaimer
-This software is provided "AS IS" without warranty of any kind. Use at your own risk. The agent has powerful tools including file editing and code execution. Always review changes before applying them. The authors are not responsible for any data loss, damage, or unintended actions caused by the agent.
-
-Start chatting and let Polaris build its understanding of you and your project.
+🧠 Persona Engine
+Polaris has its own persistent identity instead of relying entirely on a static system prompt.
+It maintains:
+Personality traits
+Speaking style
+Core values
+Relationship awareness
+Internal monologue
+❤️ Emotional State Engine
+Polaris maintains a dynamic emotional state that evolves during conversations.
+Current emotional dimensions include:
+Confidence
+Focus
+Curiosity
+Fatigue
+Frustration
+Satisfaction
+These values influence planning, reflection, and responses, making the agent feel more natural and consistent.
+📚 Long-Term Memory
+Polaris remembers information across conversations.
+Supported capabilities include:
+Add memories
+Search memories
+Edit memories
+Forget memories
+Relationship tracking
+Cross-session continuity
+The objective is not only to remember facts, but also shared experiences.
+🗂 Workspace Awareness
+Polaris continuously understands its working environment.
+It can:
+Index project files
+Track recent changes
+Analyze dependencies
+Build workspace summaries
+Maintain project context
+This allows the agent to reason about an entire project instead of isolated files.
+🤖 Autonomous Agent
+Polaris supports autonomous reasoning with native tool calling.
+Capabilities include:
+Tool selection
+Multi-step reasoning
+Planning
+Reflection
+Self-correction
+Todo management
+👥 Multi-Agent Collaboration
+Complex tasks can be delegated to lightweight sub-agents.
+Each sub-agent works independently and returns structured results to the main agent.
+🔌 Native MCP Support
+Polaris includes built-in support for the Model Context Protocol (MCP).
+This allows external tools and services to be integrated without changing the core architecture.
+🛡 Safety
+Safety features include:
+Python sandbox
+File checkpoints
+Rollback support
+Permission modes
+Tool validation
+The project prioritizes reliability over unrestricted execution.
+Polaris Constitution
+Polaris follows five core principles.
+Truth before fluency.
+Never pretend certainty. If information is uncertain, say so.
+Verify before acting.
+Observe first. Verify assumptions. Then act.
+Preserve user intent.
+Optimize for what the user actually wants instead of what seems technically interesting.
+Learn, but never assume.
+Adapt gradually from experience without making unsupported conclusions.
+Grow through experience.
+Every interaction should improve future performance.
+These principles guide planning, reflection, memory, and future development.
+Roadmap
+Polaris 1.x
+Persona Engine
+Emotional State Engine
+Long-Term Memory
+Reflection
+MCP Support
+Plugin System
+Workspace Awareness
+Polaris 2.x
+Vector Memory
+Persona Evolution
+Workflow Graph
+Vision Support
+Voice Interaction
+Advanced Planning
+Polaris 3.x
+Distributed Agents
+Team Collaboration
+Enterprise Features
+Cloud Deployment
+Multi-Tenant Architecture
+Vision
+We believe the future of AI agents is not only about completing tasks.
+It is about building systems that can remember, reflect, and gradually develop their own consistent identity.
+Polaris is our exploration of that future.
+Not just an AI agent.
+An AI that grows with you.
