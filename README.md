@@ -68,4 +68,7 @@ Project Files
 - .miniagent_checkpoints/        File modification backups
 - AGENT.md                       Project guidelines (recommended)
 
+Disclaimer
+This software is provided "AS IS" without warranty of any kind. Use at your own risk. The agent has powerful tools including file editing and code execution. Always review changes before applying them. The authors are not responsible for any data loss, damage, or unintended actions caused by the agent.
+
 Start chatting and let Polaris build its understanding of you and your project.
