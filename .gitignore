@@ -1,0 +1,37 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# ── Polaris 运行时状态 ────────────────────────────────────────────────────────
+# 这些文件是 Polaris 跑起来之后在当前工作目录生成的「大脑」：心情、人格、
+# 关系、长期记忆、对话档案。它们属于某一次具体的使用，不属于源码——
+# 提交进仓库既没意义，也会把私人对话内容泄漏出去。
+agent_memory.json
+agent_mood.json
+agent_persona.json
+agent_relationship.json
+agent_conversations.jsonl
+agent_todos.json
+
+# 文件修改前的自动备份（/undo 的数据来源）与运行时状态快照
+.miniagent_checkpoints/
+.polaris_snapshots/
+
+# 用户自己放的插件目录
+plugins/
+
+# ── 密钥 ──────────────────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── 编辑器 / 系统 ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
