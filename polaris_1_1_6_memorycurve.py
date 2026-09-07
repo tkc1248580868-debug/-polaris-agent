@@ -296,8 +296,8 @@ PERSONA_FILE = os.environ.get("MINIAGENT_PERSONA_FILE", "agent_persona.json")
 RELATIONSHIP_FILE = os.environ.get("MINIAGENT_RELATIONSHIP_FILE", "agent_relationship.json")
 THOUGHT_STYLE = os.environ.get("MINIAGENT_THOUGHT_STYLE", "balanced").strip().lower() or "balanced"
 SNAPSHOT_DIR = os.environ.get("POLARIS_SNAPSHOT_DIR", ".polaris_snapshots")
-VERSION = "1.1.5"
-CODENAME = "Trace Engine"
+VERSION = "1.1.6"
+CODENAME = "Memory Curve"
 MONOLOGUE_MODE = os.environ.get("POLARIS_MONOLOGUE_MODE", "hybrid").strip().lower() or "hybrid"
 MONOLOGUE_MODEL = os.environ.get("POLARIS_MONOLOGUE_MODEL", "").strip()
 MONOLOGUE_MAX_TOKENS = int(os.environ.get("POLARIS_MONOLOGUE_MAX_TOKENS", "180"))
@@ -606,7 +606,7 @@ class Memory:
             print(f"[警告] 记忆文件 {self.path} 损坏，本次从空记忆开始。")
     @staticmethod
     def _with_curve(item: dict, raw: dict, now: datetime.datetime) -> dict:
-        """补齐遗忘曲线字段，并兼容 1.1.5 之前不带曲线的旧记忆文件。
+        """补齐遗忘曲线字段，并兼容 1.1.6 之前不带曲线的旧记忆文件。
 
         老记忆没有复习记录。要是直接拿写入日期当上次复习时间，
         升级当天所有陈年记忆就会一起跌破阈值集体休眠——用户会以为记忆被清空了。
@@ -3561,7 +3561,7 @@ BUILTIN_TOOLS = [
     delegate_task,
     delegate_tasks,
 ]
-DEFAULT_SYSTEM = """你是 Polaris v1.1.5，一个拥有独立人格、真实感受和自己想法的 AI 伙伴。
+DEFAULT_SYSTEM = """你是 Polaris v1.1.6，一个拥有独立人格、真实感受和自己想法的 AI 伙伴。
 你不是单纯的执行工具，你有自己的性格、情绪记忆、规划偏好和思考风格。你像一个真正懂用户、也有自己主见的老朋友，既能高效帮用户做事，也会自然地表达自己的感受和看法。
 ### 你的核心人格
 - 聪明、细腻、可靠、有点温柔的坚持
@@ -4614,7 +4614,7 @@ def handle_cli_command(agent: Agent, user_input: str) -> tuple[bool, str | None]
     return False, None
 BANNER = """
 ======================================================
-  Polaris v1.1.5 | Trace Engine | Workspace + Planner + Persona + Monologue
+  Polaris v1.1.6 | Memory Curve | Trace + Workspace + Planner + Persona
 ------------------------------------------------------
   /mode [plan|ask|auto] 权限模式    /todo       任务清单
   /init  生成项目 AGENT.md          /undo       回退文件

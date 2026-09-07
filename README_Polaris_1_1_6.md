@@ -1,4 +1,4 @@
-# Polaris v1.1.5 — "Trace Engine"
+# Polaris v1.1.6 — "Memory Curve"
 
 An AI that grows with you.
 
@@ -11,11 +11,120 @@ to your project.
 
 ---
 
-## What v1.1.5 adds
+## What v1.1.6 adds
 
-v1.1.0 gave Polaris an inner life. v1.1.5 makes that inner life **observable and
-auditable** — and fixes several places where the internal state was working
-against the agent instead of for it.
+One thing, and it replaces the oldest part of Polaris: long-term memory.
+
+### Memory: vectors and the forgetting curve
+
+Long-term memory used to be an append-only log ranked by keyword overlap plus a
+recency bonus. It had no way to tell a hard-won lesson from a throwaway note, and
+nothing ever left the list — so the memory section of the prompt slowly filled up
+with whatever happened to be written most recently.
+
+Memory is now a **vector store on an Ebbinghaus forgetting curve**. Every entry
+decays on its own schedule, and every successful recall makes it decay slower.
+
+#### The curve
+
+```
+R = exp(-t / S)
+```
+
+`R` is the probability the memory is still available right now, `t` is days since
+it was last recalled, and `S` is its strength in days. Half-life is `S · ln 2`.
+
+Each recall counts as a review, and strength grows by the **spacing effect**:
+
+```
+S ← S · (1 + 1.8 · quality · (1 − R))
+```
+
+Recall something you just recalled (`R ≈ 1`) and it barely grows — cramming does
+not work here either. Recall something you were about to lose (`R` low) and it
+grows the most. Passive recall (a memory auto-injected into the prompt) counts at
+half quality; an explicit `recall_memories` call counts in full.
+
+New memories start at a strength set by their category, because not all memories
+deserve the same lifespan:
+
+| Category | Initial strength | Half-life |
+|---|---|---|
+| `identity` — who the user is | 30 d | ~21 d |
+| `preference` — long-standing preferences | 14 d | ~10 d |
+| `lesson` — a trap already stepped in | 5 d | ~3.5 d |
+| `fact` — everything else | 1.5 d | ~1 d |
+
+Those numbers are deliberately short. A memory that genuinely matters gets
+recalled, and recall is what makes it permanent — a fact recalled four or five
+times is already good for months.
+
+#### Retrieval
+
+Search is hybrid, and retention is a weight rather than a filter:
+
+```
+base  = 0.62 · cosine(query, memory) + 0.38 · keyword_overlap
+score = base · (0.35 + 0.65 · R)
+```
+
+Being hard to recall is not the same as being unreachable, so a fading memory
+that matches well still beats a vivid one that matches poorly.
+
+#### Forgetting, and how to undo it
+
+A memory at least three days old that has fallen below 5% retention goes
+**dormant** (both thresholds are configurable).
+Dormant memories drop out of the auto-injected context and out of `/memory` —
+they are **never deleted**. Three ways back:
+
+- A **specific cue** pulls one back on its own (cued recall): a query that matches
+  it precisely still retrieves it, and doing so revives it. A vague query does not
+  — otherwise nothing would ever be forgotten.
+- `/recall <query>` and `recall_memories` can search dormant entries explicitly.
+- `/revive <id>` wakes one; `/pin <id>` makes it permanent and exempt from decay.
+
+`/memstat` shows the whole curve: what is vivid, what is fading, what is asleep.
+
+#### Embeddings
+
+Two backends, chosen automatically:
+
+| | `remote` | `local` (fallback) |
+|---|---|---|
+| Source | any OpenAI-compatible `/embeddings` endpoint | pure-Python hashed bag-of-features |
+| Semantics | real — paraphrases match | **lexical only** — shares tokens and character bigrams |
+| Cost | one batched call per new memory set | none |
+| Persisted | yes, to `agent_memory_vectors.json` | no — recomputed on demand |
+
+The local embedder is honest about what it is: a 1024-dimensional signed hash of
+tokens and character bigrams with sublinear term weighting. It will not connect
+"canine" to "dog". It exists so that Polaris keeps working with no API key, no
+network, and no dependencies, and so that a remote outage degrades quietly
+instead of taking memory down with it. If you want real semantic recall, point
+`POLARIS_EMBED_MODEL` at an embedding model.
+
+1024 dimensions is measured, not guessed: at 256, hash collisions crushed the
+cosine of a related Chinese sentence pair from 0.124 to 0.051 and manufactured a
+−0.065 signal between unrelated ones. At 1024 both converge on their
+collision-free values. Local vectors are not persisted because recomputing one
+costs well under a millisecond — far less than the megabytes a dense sidecar
+would cost. Remote vectors are persisted, because those cost money.
+
+#### Upgrading
+
+Old `agent_memory.json` files load unchanged. Entries with no curve data are
+treated as reviewed *at upgrade time* rather than at their original write date —
+otherwise every memory older than a few days would go dormant the moment you
+upgraded, and it would look like Polaris had wiped your history.
+
+---
+
+## What v1.1.5 added
+
+v1.1.0 gave Polaris an inner life. v1.1.5 made that inner life **observable and
+auditable** — and fixed several places where the internal state was working
+against the agent instead of for it. It ships here as part of v1.1.6.
 
 ### Trace Engine
 
@@ -92,118 +201,13 @@ means a more careful strategy, not a smaller budget.
 
 ---
 
-## Memory: vectors and the forgetting curve
-
-Long-term memory used to be an append-only log ranked by keyword overlap plus a
-recency bonus. It had no way to tell a hard-won lesson from a throwaway note, and
-nothing ever left the list — so the memory section of the prompt slowly filled up
-with whatever happened to be written most recently.
-
-Memory is now a **vector store on an Ebbinghaus forgetting curve**. Every entry
-decays on its own schedule, and every successful recall makes it decay slower.
-
-### The curve
-
-```
-R = exp(-t / S)
-```
-
-`R` is the probability the memory is still available right now, `t` is days since
-it was last recalled, and `S` is its strength in days. Half-life is `S · ln 2`.
-
-Each recall counts as a review, and strength grows by the **spacing effect**:
-
-```
-S ← S · (1 + 1.8 · quality · (1 − R))
-```
-
-Recall something you just recalled (`R ≈ 1`) and it barely grows — cramming does
-not work here either. Recall something you were about to lose (`R` low) and it
-grows the most. Passive recall (a memory auto-injected into the prompt) counts at
-half quality; an explicit `recall_memories` call counts in full.
-
-New memories start at a strength set by their category, because not all memories
-deserve the same lifespan:
-
-| Category | Initial strength | Half-life |
-|---|---|---|
-| `identity` — who the user is | 30 d | ~21 d |
-| `preference` — long-standing preferences | 14 d | ~10 d |
-| `lesson` — a trap already stepped in | 5 d | ~3.5 d |
-| `fact` — everything else | 1.5 d | ~1 d |
-
-Those numbers are deliberately short. A memory that genuinely matters gets
-recalled, and recall is what makes it permanent — a fact recalled four or five
-times is already good for months.
-
-### Retrieval
-
-Search is hybrid, and retention is a weight rather than a filter:
-
-```
-base  = 0.62 · cosine(query, memory) + 0.38 · keyword_overlap
-score = base · (0.35 + 0.65 · R)
-```
-
-Being hard to recall is not the same as being unreachable, so a fading memory
-that matches well still beats a vivid one that matches poorly.
-
-### Forgetting, and how to undo it
-
-A memory at least three days old that has fallen below 5% retention goes
-**dormant** (both thresholds are configurable).
-Dormant memories drop out of the auto-injected context and out of `/memory` —
-they are **never deleted**. Three ways back:
-
-- A **specific cue** pulls one back on its own (cued recall): a query that matches
-  it precisely still retrieves it, and doing so revives it. A vague query does not
-  — otherwise nothing would ever be forgotten.
-- `/recall <query>` and `recall_memories` can search dormant entries explicitly.
-- `/revive <id>` wakes one; `/pin <id>` makes it permanent and exempt from decay.
-
-`/memstat` shows the whole curve: what is vivid, what is fading, what is asleep.
-
-### Embeddings
-
-Two backends, chosen automatically:
-
-| | `remote` | `local` (fallback) |
-|---|---|---|
-| Source | any OpenAI-compatible `/embeddings` endpoint | pure-Python hashed bag-of-features |
-| Semantics | real — paraphrases match | **lexical only** — shares tokens and character bigrams |
-| Cost | one batched call per new memory set | none |
-| Persisted | yes, to `agent_memory_vectors.json` | no — recomputed on demand |
-
-The local embedder is honest about what it is: a 1024-dimensional signed hash of
-tokens and character bigrams with sublinear term weighting. It will not connect
-"canine" to "dog". It exists so that Polaris keeps working with no API key, no
-network, and no dependencies, and so that a remote outage degrades quietly
-instead of taking memory down with it. If you want real semantic recall, point
-`POLARIS_EMBED_MODEL` at an embedding model.
-
-1024 dimensions is measured, not guessed: at 256, hash collisions crushed the
-cosine of a related Chinese sentence pair from 0.124 to 0.051 and manufactured a
-−0.065 signal between unrelated ones. At 1024 both converge on their
-collision-free values. Local vectors are not persisted because recomputing one
-costs well under a millisecond — far less than the megabytes a dense sidecar
-would cost. Remote vectors are persisted, because those cost money.
-
-### Upgrading
-
-Old `agent_memory.json` files load unchanged. Entries with no curve data are
-treated as reviewed *at upgrade time* rather than at their original write date —
-otherwise every memory older than a few days would go dormant the moment you
-upgraded, and it would look like Polaris had wiped your history.
-
----
-
 ## Quick start
 
 ```bash
 pip install openai
 
 export OPENAI_API_KEY=sk-...
-python polaris_1_1_5_traceengine.py
+python polaris_1_1_6_memorycurve.py
 ```
 
 Local models — no API key needed:
@@ -211,7 +215,7 @@ Local models — no API key needed:
 ```bash
 export MINIAGENT_BACKEND=ollama        # or: lmstudio
 export MINIAGENT_MODEL=qwen2.5:14b
-python polaris_1_1_5_traceengine.py
+python polaris_1_1_6_memorycurve.py
 ```
 
 Verify the install without spending a token:
