@@ -165,7 +165,7 @@ file edit.
 
 ### Self-tests
 
-`/selftest` runs a nineteen-check suite covering JSON parsing, context building,
+`/selftest` runs a twenty-check suite covering JSON parsing, context building,
 snapshot round-trip, calculator sandbox escapes, shell guard rules, context
 starvation, step-budget direction, trace wiring, sub-agent isolation, tool
 description coverage, and three memory checks — curve direction and the spacing
@@ -241,8 +241,17 @@ on top of it. It is shown to you on its own channel, and stripped from the final
 answer.
 
 Where the endpoint exposes native reasoning tokens (`reasoning_content` — DeepSeek-R1,
-QwQ, vLLM and friends), that is captured directly instead: the model's own
-reasoning, at no extra cost and with no prompting required.
+QwQ, vLLM and friends), **that** is the chain of thought: the model's own reasoning
+is used directly, folded into the message history exactly like a `<thinking>` block,
+at no extra cost. Polaris also stops asking for `<thinking>` once it notices the
+model reasons natively — no point teaching a model to do what it already does, and
+paying twice in tokens to hear it said twice.
+
+The reasoning is folded in as ordinary message *content*. `reasoning_content` is
+never sent back as a request field, because providers such as DeepSeek reject that
+outright. If your provider would rather not see its own prior reasoning, set
+`POLARIS_COT_FEEDBACK=0` — the thinking is still displayed, but it stops being
+causal, which is the whole point, so only do this if a provider forces you to.
 
 The difference is causal, not cosmetic, and `/selftest` checks exactly that: the
 reasoning must appear in the message history and must not appear in the answer.
@@ -356,7 +365,8 @@ Every file write is checkpointed first — `/undo` restores the previous version
 | `MINIAGENT_THOUGHT_STYLE` | `balanced` | Thinking style. |
 | `POLARIS_MONOLOGUE_MODE` | `cot` | `cot` (real chain of thought) · `template` (offline flavour, no API call) · `llm` / `hybrid` (legacy: a separate call whose output never reaches the answer) |
 | `POLARIS_MONOLOGUE_MODEL` | (main model) | Separate model for the monologue. |
-| `POLARIS_MONOLOGUE_MAX_TOKENS` | `180` | Monologue length cap. |
+| `POLARIS_MONOLOGUE_MAX_TOKENS` | `180` | Monologue length cap (legacy modes only). |
+| `POLARIS_COT_FEEDBACK` | `true` | Keep the model's reasoning in the message history so it informs later steps. Turning it off makes the chain of thought decorative again. |
 | `POLARIS_SHELL_ALLOW_DANGEROUS` | `false` | Lift the destructive-command block. |
 | `MINIAGENT_PLUGIN_DIRS` | `plugins` | Comma-separated plugin directories. |
 | `POLARIS_EMBED_BACKEND` | `auto` | `auto` · `remote` · `local`. `auto` uses the remote model when an endpoint is configured, else the local hash embedder. |

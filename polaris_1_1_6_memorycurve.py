@@ -311,6 +311,9 @@ CODENAME = "Memory Curve"
 # 影响后续每一步，同时展示给用户。template = 离线模板独白（不发请求）。
 # llm / hybrid 是 1.1.6 之前的老行为：为一段打印完就丢的话另开一次请求，保留仅为兼容。
 MONOLOGUE_MODE = os.environ.get("POLARIS_MONOLOGUE_MODE", "cot").strip().lower() or "cot"
+# 模型的思考要不要写进消息历史。关掉就只展示不入历史（个别服务商建议
+# 多轮之间不回喂自己的 CoT），但那样思考就不再影响后续决策了。
+COT_FEEDBACK = _env_bool("POLARIS_COT_FEEDBACK", True)
 MONOLOGUE_MODEL = os.environ.get("POLARIS_MONOLOGUE_MODEL", "").strip()
 MONOLOGUE_MAX_TOKENS = int(os.environ.get("POLARIS_MONOLOGUE_MAX_TOKENS", "180"))
 MONOLOGUE_USE_TAGS = _env_bool("POLARIS_MONOLOGUE_USE_TAGS", True)
@@ -3782,6 +3785,7 @@ class Agent:
         self._current_user_input = ""
         self._thinking_open = False
         self.last_reasoning = ""
+        self._native_reasoning_seen = False
         self.instructions = self.reload_instructions()
         if auto_load_plugins:
             self.loaded_plugins = load_plugin_tools(self)
@@ -3967,12 +3971,14 @@ class Agent:
             self.system_base,
             self.instructions,
             self.mode,
-            self.model,
+            f"{self.model}|native_cot={self._native_reasoning_seen}",
         )
         if cache_key == self._system_prompt_cache_key and self._system_prompt_cache:
             return self._system_prompt_cache
         parts = [self.system_base]
-        if MONOLOGUE_MODE == "cot":
+        # 模型自己会思考的话就不用再教它思考了：原生推理已经在做这件事，
+        # 再要一个 <thinking> 只会让它把话说两遍，白烧 token。
+        if MONOLOGUE_MODE == "cot" and not self._native_reasoning_seen:
             parts.append(COT_INSTRUCTION)
         if self.instructions:
             parts.append("[项目自定义指令]\n" + self.instructions)
@@ -4053,6 +4059,24 @@ class Agent:
         if self._thinking_open:
             print(f"\n{self.tag}  ───────────────" if self.tag else "\n  ───────────────", flush=True)
             self._thinking_open = False
+    def _fold_reasoning(self, content: str, native: str) -> str:
+        """把模型的原生思考写进消息内容，让它和 <thinking> 走同一条因果链。
+
+        原生推理（reasoning_content）如果只是打印出来就丢，对 DeepSeek-R1 /
+        QwQ 这类模型来说，CoT 依旧是不因果的——展示了，但下一步看不见。
+        这里把它折进 content，后续每一步都读得到。
+
+        注意：折进的是 content（普通文本），绝不能把 reasoning_content 原样塞回
+        请求里——DeepSeek 等服务端会直接返回 400。
+        少数服务商建议多轮之间不要回喂自己的 CoT，需要的话
+        POLARIS_COT_FEEDBACK=0 可以只展示不入历史。"""
+        native = (native or "").strip()
+        if not native:
+            return content
+        self._native_reasoning_seen = True
+        if not COT_FEEDBACK:
+            return content
+        return f"<thinking>{native}</thinking>\n{content}".strip()
     def _record_reasoning(self, reasoning: str) -> None:
         """留档最近一次真实推理：给 /trace、给上下文 provider 用。"""
         text = (reasoning or "").strip()
@@ -4124,11 +4148,12 @@ class Agent:
             print()
             # 存进 messages 的是原样输出（含 <thinking>），后续每一步都看得到它——
             # 这正是「真 CoT」的关键：思考留在上下文里，才谈得上影响决策。
+            current_msg["content"] = self._fold_reasoning(current_msg["content"], native_reasoning)
             self.messages.append(current_msg)
             self._trim_messages()
             self._record_reasoning(native_reasoning or splitter.thinking)
             visible = dict(current_msg)
-            visible["content"] = splitter.answer.strip() if splitter.thinking else current_msg["content"]
+            visible["content"] = splitter.answer.strip() if (splitter.thinking or native_reasoning) else current_msg["content"]
             return visible
         res = self.backend.create_chat_completion(**params)
         msg = res.choices[0].message
@@ -4150,11 +4175,12 @@ class Agent:
             self._end_thinking()
             if answer:
                 print(answer)
+        built_msg["content"] = self._fold_reasoning(built_msg["content"], native)
         self.messages.append(built_msg)
         self._trim_messages()
         self._record_reasoning(native or thinking)
         visible = dict(built_msg)
-        if thinking:
+        if thinking or native:
             visible["content"] = answer
         return visible
     def _run_tools_and_feed_back(self, assistant_msg: dict) -> None:
@@ -4728,6 +4754,36 @@ def run_self_tests() -> str:
         checks.append(("cot_is_causal", ok, "思考入历史、不入答案、跨分片可拆"))
     except Exception as e:
         checks.append(("cot_is_causal", False, str(e)))
+    try:
+        # 模型自带思考时（DeepSeek-R1 / QwQ 的 reasoning_content），
+        # 要直接用它的思考，而且同样必须进历史——只展示不入历史就还是不因果。
+        class _NativeBackend(ChatBackend):
+            name = "selftest_native"
+            def create_chat_completion(self, **kwargs):
+                msg = types.SimpleNamespace(
+                    reasoning_content="先读文件再改，别猜。", content="已修复。", tool_calls=None)
+                return types.SimpleNamespace(choices=[types.SimpleNamespace(message=msg)])
+        probe = Agent.__new__(Agent)
+        probe.backend, probe.model, probe.max_tokens = _NativeBackend(), "m", 16
+        probe.stream, probe.quiet, probe.tag = False, True, ""
+        probe.tools, probe.mcp_servers, probe._mcp_tool_map = {}, {}, {}
+        probe.messages, probe.max_context_messages = [], 40
+        probe.trace_enabled, probe._thinking_open = False, False
+        probe.last_reasoning, probe._native_reasoning_seen = "", False
+        probe._api_messages = lambda: []
+        visible = probe._call_llm()
+        stored = probe.messages[-1]["content"]
+        ok = (
+            "先读文件再改" in stored                       # 原生思考写进了历史
+            and visible["content"] == "已修复。"            # 但不进答案
+            and probe._native_reasoning_seen               # 记住了模型自带思考
+            and probe.last_reasoning == "先读文件再改，别猜。"
+            # 绝不能把 reasoning_content 当消息字段送回去，DeepSeek 会直接 400
+            and "reasoning_content" not in json.dumps(probe.messages, ensure_ascii=False)
+        )
+        checks.append(("native_reasoning_causal", ok, "原生思考入历史且不回传 reasoning_content"))
+    except Exception as e:
+        checks.append(("native_reasoning_causal", False, str(e)))
     try:
         lines = []
         for name, passed, detail in checks:
