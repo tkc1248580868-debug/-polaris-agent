@@ -217,6 +217,8 @@ class ChatBackend:
         response_format: dict | None = None,
     ):
         raise NotImplementedError
+    def create_embeddings(self, *, model: str, inputs: list[str]) -> list[list[float]]:
+        raise NotImplementedError(f"后端 {self.name} 不支持向量嵌入。")
 class OpenAICompatibleBackend(ChatBackend):
     name = "openai_compatible"
     def __init__(self, api_key: str | None, base_url: str | None):
@@ -244,6 +246,11 @@ class OpenAICompatibleBackend(ChatBackend):
         if response_format is not None:
             params["response_format"] = response_format
         return self.client.chat.completions.create(**params, stream=stream)
+    def create_embeddings(self, *, model: str, inputs: list[str]) -> list[list[float]]:
+        resp = self.client.embeddings.create(model=model, input=inputs)
+        # 返回顺序按 index 排，不依赖服务端保证的顺序。
+        rows = sorted(resp.data, key=lambda item: getattr(item, "index", 0))
+        return [[float(x) for x in row.embedding] for row in rows]
 _BACKEND_FACTORIES: dict[str, Callable[[], ChatBackend]] = {}
 def register_backend(name: str, factory: Callable[[], ChatBackend]) -> None:
     _BACKEND_FACTORIES[name.strip().lower()] = factory
@@ -267,6 +274,17 @@ MODEL = os.environ.get("MINIAGENT_MODEL", "gpt-4o")
 MAIN_MODEL = MODEL
 GATE_MODEL = MODEL
 MEMORY_FILE = os.environ.get("MINIAGENT_MEMORY_FILE", "agent_memory.json")
+MEMORY_VECTOR_FILE = os.environ.get("MINIAGENT_MEMORY_VECTOR_FILE", "agent_memory_vectors.json")
+# 向量记忆：auto = 有远程嵌入就用，没有就退回本地哈希向量；local 强制离线；remote 强制远程。
+EMBED_BACKEND = os.environ.get("POLARIS_EMBED_BACKEND", "auto").strip().lower() or "auto"
+EMBED_MODEL = os.environ.get("POLARIS_EMBED_MODEL", "text-embedding-3-small").strip()
+# 1024 维是实测出来的：256 维时哈希碰撞会把一对相关中文句子的余弦从 0.12 压到 0.05，
+# 还会给完全无关的句子造出 -0.06 的假信号；1024 维恰好收敛到无碰撞的理想值。
+EMBED_DIM = max(32, int(os.environ.get("POLARIS_EMBED_DIM", "1024")))
+EMBED_BATCH_CAP = max(16, int(os.environ.get("POLARIS_EMBED_BATCH_CAP", "256")))
+# 遗忘曲线：R = exp(-t / S)。低于这个保持率且长期没被想起的记忆转入休眠（不删除）。
+MEMORY_FORGET_THRESHOLD = float(os.environ.get("POLARIS_MEMORY_FORGET_THRESHOLD", "0.05"))
+MEMORY_DORMANT_MIN_DAYS = float(os.environ.get("POLARIS_MEMORY_DORMANT_MIN_DAYS", "3"))
 MOOD_FILE = os.environ.get("MINIAGENT_MOOD_FILE", "agent_mood.json")
 CHECKPOINT_DIR = os.environ.get("MINIAGENT_CHECKPOINT_DIR", ".miniagent_checkpoints")
 CONVERSATION_FILE = os.environ.get("MINIAGENT_CONVERSATION_FILE", "agent_conversations.jsonl")
@@ -316,11 +334,245 @@ def tool(fn: Callable | None = None, *, name: str | None = None, description: st
         func.mutating = mutating or dangerous
         return func
     return decorator(fn) if fn is not None else decorator
+# ───────────────────────────────────────────────────────────────────────────────
+# Vector memory + Ebbinghaus forgetting curve
+# 记忆不再是「越新越靠前」的流水账：写进来的每条记忆都带一条遗忘曲线，
+# 被想起来就变结实，长期没被想起就自己淡出上下文。检索走向量 + 关键词混合。
+# ───────────────────────────────────────────────────────────────────────────────
+def _now_dt() -> datetime.datetime:
+    return datetime.datetime.now()
+def _iso(dt: datetime.datetime) -> str:
+    return dt.replace(microsecond=0).isoformat()
+def _parse_dt(value: Any, fallback: datetime.datetime) -> datetime.datetime:
+    text = str(value or "").strip()
+    if not text:
+        return fallback
+    try:
+        return datetime.datetime.fromisoformat(text)
+    except ValueError:
+        pass
+    try:  # 只有日期的老格式（2026-09-07）按当天零点算。
+        return datetime.datetime.combine(datetime.date.fromisoformat(text[:10]), datetime.time())
+    except ValueError:
+        return fallback
+def _elapsed_days(since: datetime.datetime, now: datetime.datetime) -> float:
+    return max(0.0, (now - since).total_seconds() / 86400.0)
+class Embedder:
+    """把文本变成单位向量。"""
+    signature = "base"
+    dim = 0
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        raise NotImplementedError
+class HashingEmbedder(Embedder):
+    """零依赖、可离线、跨进程稳定的哈希词袋向量。
+
+    用 blake2b 把 token 和字符 bigram 散列到固定维度（带符号哈希，抵消碰撞偏置），
+    再做次线性词频加权和 L2 归一化。
+    诚实地说：它捕捉的是字面重合，不是真正的近义——「狗」和「犬」在这里并不接近。
+    真正的语义召回需要 POLARIS_EMBED_BACKEND=remote 接一个嵌入模型。"""
+    def __init__(self, dim: int = EMBED_DIM):
+        self.dim = max(32, int(dim))
+        self.signature = f"hash-{self.dim}"
+    def _feature_weights(self, text: str) -> Counter:
+        feats: Counter = Counter()
+        for token in _normalize_text(text):
+            # _normalize_text 会把整段中文原样当成一个 token 丢出来。这种长串几乎
+            # 不可能在两条文本间重合，留在向量里只会拉长模长、压低真实相似度，
+            # 所以只保留字、二元组和短词；长整句的字面命中交给关键词通道去管。
+            if len(token) > 3 and re.fullmatch(r"[一-鿿]+", token):
+                continue
+            feats[token] += 1
+        for gram in _char_ngrams(text, 2):
+            feats[f"#{gram}"] += 1
+        return feats
+    def embed_one(self, text: str) -> list[float]:
+        vec = [0.0] * self.dim
+        for feature, count in self._feature_weights(text).items():
+            digest = hashlib.blake2b(feature.encode("utf-8", "replace"), digest_size=8).digest()
+            slot = int.from_bytes(digest[:4], "big") % self.dim
+            sign = 1.0 if digest[4] & 1 else -1.0
+            vec[slot] += sign * (1.0 + math.log(count))  # 次线性词频，压住高频词
+        return _l2_normalize(vec)
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return [self.embed_one(text) for text in texts]
+class RemoteEmbedder(Embedder):
+    """走 OpenAI-Compatible /embeddings 的真语义向量。"""
+    def __init__(self, model: str = EMBED_MODEL):
+        self.model = model or EMBED_MODEL
+        self.signature = f"remote-{self.model}"
+        self._backend: ChatBackend | None = None
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        if self._backend is None:
+            self._backend = build_backend()
+        rows = self._backend.create_embeddings(model=self.model, inputs=texts)
+        if len(rows) != len(texts):
+            raise RuntimeError(f"嵌入返回条数不匹配：要 {len(texts)} 条，回 {len(rows)} 条")
+        vectors = [_l2_normalize(row) for row in rows]
+        self.dim = len(vectors[0]) if vectors else 0
+        return vectors
+def _l2_normalize(vec: list[float]) -> list[float]:
+    norm = math.sqrt(sum(x * x for x in vec))
+    if norm <= 1e-12:
+        return [0.0] * len(vec)
+    return [x / norm for x in vec]
+def _cosine(a: list[float], b: list[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    return sum(x * y for x, y in zip(a, b))  # 两边都已归一化，点积即余弦
+class EmbeddingService:
+    """选嵌入实现，并在远程不可用时安静地退回本地哈希向量。"""
+    def __init__(self, mode: str = EMBED_BACKEND, model: str = EMBED_MODEL, dim: int = EMBED_DIM):
+        self.mode = mode if mode in {"auto", "local", "remote"} else "auto"
+        self.local = HashingEmbedder(dim)
+        self.remote: RemoteEmbedder | None = None
+        self._warned = False
+        if self.mode == "remote" or (self.mode == "auto" and (API_KEY or BASE_URL)):
+            self.remote = RemoteEmbedder(model)
+        # 本地哈希向量是确定性的，重算比读盘还快，没必要为它留一个几 MB 的文件；
+        # 远程向量要花钱，才值得落盘。
+        self.persistent = self.remote is not None
+    @property
+    def signature(self) -> str:
+        return self.remote.signature if self.remote is not None else self.local.signature
+    def degrade(self, reason: str) -> None:
+        self.remote = None
+        self.persistent = False
+        if not self._warned:
+            self._warned = True
+            print(f"[记忆] 嵌入模型不可用（{reason}），本次会话改用本地哈希向量。")
+    def embed_many(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        if self.remote is not None:
+            try:
+                return self.remote.embed(texts)
+            except Exception as e:
+                self.degrade(str(e)[:120])
+        return self.local.embed(texts)
+    def embed(self, text: str) -> list[float]:
+        return self.embed_many([text])[0]
+class VectorStore:
+    """记忆向量的旁路存储。
+
+    单独存一个文件，是为了让 agent_memory.json 保持人能读的样子——
+    没人想在几百维浮点里找自己上周说过的偏好。
+    换了嵌入模型（签名变化）就整体作废，下次检索时按需重算。
+    只有远程嵌入才落盘：本地哈希向量重算一次不到一毫秒，存下来纯属浪费磁盘。"""
+    def __init__(self, path: str = MEMORY_VECTOR_FILE, service: EmbeddingService | None = None):
+        self.path = path
+        self.service = service or EmbeddingService()
+        self.signature = self.service.signature
+        self.vectors: dict[int, list[float]] = {}
+        self._dirty = False
+        self._load()
+    def _load(self) -> None:
+        if not self.service.persistent or not os.path.exists(self.path):
+            return
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                data = json.load(f)
+            if str(data.get("signature", "")) != self.signature:
+                return  # 嵌入空间变了，旧向量不可比，丢掉重算
+            raw = data.get("vectors", {})
+            if not isinstance(raw, dict):
+                return
+            for key, vec in raw.items():
+                try:
+                    self.vectors[int(key)] = [float(x) for x in vec]
+                except (TypeError, ValueError):
+                    continue
+        except Exception:
+            print(f"[警告] 记忆向量文件 {self.path} 损坏，本次重新计算向量。")
+    def save(self) -> None:
+        if not self._dirty or not self.service.persistent:
+            return
+        with _STATE_LOCK:
+            payload = {
+                "signature": self.signature,
+                # 归一化后的分量都在 ±1 内，5 位小数够用，能把文件砍掉一半还多。
+                "vectors": {str(mid): [round(x, 5) for x in vec] for mid, vec in self.vectors.items()},
+            }
+            _atomic_write_text(self.path, json.dumps(payload, ensure_ascii=False))
+            self._dirty = False
+    def _sync_signature(self) -> None:
+        # 远程降级到本地是会话中途发生的，这时旧向量和新向量不在同一个空间里。
+        if self.service.signature != self.signature:
+            self.signature = self.service.signature
+            self.vectors.clear()
+            self._dirty = True
+    def get(self, memory_id: int) -> list[float] | None:
+        self._sync_signature()
+        return self.vectors.get(int(memory_id))
+    def put(self, memory_id: int, vector: list[float]) -> None:
+        self._sync_signature()
+        self.vectors[int(memory_id)] = vector
+        self._dirty = True
+    def remove(self, memory_id: int) -> None:
+        if self.vectors.pop(int(memory_id), None) is not None:
+            self._dirty = True
+    def embed_text(self, text: str) -> list[float]:
+        self._sync_signature()
+        vector = self.service.embed(text)
+        self._sync_signature()  # embed 过程里可能刚刚降级
+        return vector
+    def ensure(self, pairs: list[tuple[int, str]], cap: int = EMBED_BATCH_CAP) -> int:
+        """给还没有向量的记忆补算向量，一次批量请求，上限 cap 条。"""
+        self._sync_signature()
+        missing = [(mid, text) for mid, text in pairs if mid not in self.vectors][:cap]
+        if not missing:
+            return 0
+        vectors = self.service.embed_many([text for _, text in missing])
+        self._sync_signature()
+        for (mid, _), vector in zip(missing, vectors):
+            self.vectors[int(mid)] = vector
+        self._dirty = True
+        self.save()
+        return len(missing)
+class ForgettingCurve:
+    """艾宾浩斯遗忘曲线。
+
+        R = exp(-t / S)
+
+    R 是此刻还记得的概率，t 是距上次想起的天数，S 是记忆强度（天）。
+    半衰期 = S · ln2，所以 S=1 的新记忆大约 17 小时就掉到一半。
+
+    每次被成功召回都算一次复习，强度按「间隔效应」增长：
+    刚想起过（R≈1）几乎不涨——临时抱佛脚没用；
+    快要忘了才想起来（R 低）涨得最多——这正是间隔重复有效的原因。"""
+    max_strength = 3650.0
+    gain = 1.8
+    min_step = 0.5
+    min_review_gap_sec = 60.0
+    # 不同类别的初始强度（天）：身份和偏好天生比一次性事实活得久。
+    initial_strength = {"identity": 30.0, "preference": 14.0, "lesson": 5.0, "fact": 1.5}
+    default_strength = 1.5
+    @classmethod
+    def initial(cls, category: str) -> float:
+        return cls.initial_strength.get(str(category).strip().lower(), cls.default_strength)
+    @staticmethod
+    def retention(strength: float, elapsed_days: float) -> float:
+        return math.exp(-max(0.0, elapsed_days) / max(1e-6, float(strength)))
+    @staticmethod
+    def half_life(strength: float) -> float:
+        return max(0.0, float(strength)) * math.log(2)
+    @classmethod
+    def reinforce(cls, strength: float, retention: float, quality: float = 1.0,
+                  deliberate: bool = False) -> float:
+        quality = max(0.0, min(1.0, float(quality)))
+        grown = float(strength) * (1.0 + cls.gain * quality * (1.0 - retention))
+        # 记忆已经开始褪色时保证一个绝对下限的增量；
+        # deliberate 是用户/模型明确说「这条要记牢」——那是主观加权，不是一次复习，
+        # 不该被间隔效应清零，否则「强化」按下去毫无反应。
+        if deliberate or retention < 0.9:
+            grown = max(grown, float(strength) + cls.min_step * quality)
+        return min(cls.max_strength, grown)
 class Memory:
-    def __init__(self, path: str = MEMORY_FILE):
+    def __init__(self, path: str = MEMORY_FILE, vector_path: str = MEMORY_VECTOR_FILE,
+                 service: EmbeddingService | None = None):
         self.path = path
         self.items: list[dict] = []
         self._next_id = 1
+        self.vectors = VectorStore(vector_path, service)
         self._load()
     def _load(self) -> None:
         if not os.path.exists(self.path):
@@ -332,6 +584,7 @@ class Memory:
                 raw_items = data.get("memories", [])
                 if not isinstance(raw_items, list):
                     raise ValueError("invalid memory format")
+                now = _now_dt()
                 cleaned: list[dict] = []
                 for item in raw_items:
                     if not isinstance(item, dict):
@@ -344,24 +597,77 @@ class Memory:
                     except Exception:
                         continue
                     if content:
-                        cleaned.append({"id": mid, "time": time, "category": category, "content": content})
+                        cleaned.append(self._with_curve(
+                            {"id": mid, "time": time, "category": category, "content": content}, item, now))
                 self.items = cleaned
                 self._next_id = max((m["id"] for m in self.items), default=0) + 1
+            self.sweep()
         except Exception:
             print(f"[警告] 记忆文件 {self.path} 损坏，本次从空记忆开始。")
+    @staticmethod
+    def _with_curve(item: dict, raw: dict, now: datetime.datetime) -> dict:
+        """补齐遗忘曲线字段，并兼容 1.1.5 之前不带曲线的旧记忆文件。
+
+        老记忆没有复习记录。要是直接拿写入日期当上次复习时间，
+        升级当天所有陈年记忆就会一起跌破阈值集体休眠——用户会以为记忆被清空了。
+        所以把这次升级本身当作一次复习：内容一条不少，曲线从今天开始走。"""
+        created = _parse_dt(raw.get("created"), _parse_dt(item["time"], now))
+        legacy = "strength" not in raw and "last_review" not in raw
+        try:
+            strength = float(raw.get("strength", ForgettingCurve.initial(item["category"])))
+        except (TypeError, ValueError):
+            strength = ForgettingCurve.initial(item["category"])
+        try:
+            reviews = max(0, int(raw.get("reviews", 0)))
+        except (TypeError, ValueError):
+            reviews = 0
+        item.update({
+            "created": _iso(created),
+            "last_review": _iso(now if legacy else _parse_dt(raw.get("last_review"), created)),
+            "reviews": reviews,
+            "strength": max(0.01, strength),
+            "pinned": bool(raw.get("pinned", False)),
+            "dormant": bool(raw.get("dormant", False)),
+        })
+        return item
     def _save(self) -> None:
         with _STATE_LOCK:
             _atomic_write_text(self.path, json.dumps({"memories": self.items}, ensure_ascii=False, indent=2))
+        self.vectors.save()
+    def persist(self) -> None:
+        self._save()
+    @staticmethod
+    def _embed_text(item: dict) -> str:
+        return f"{item.get('category', '')} {item.get('content', '')}".strip()
+    def get(self, memory_id: int) -> dict | None:
+        return next((m for m in self.items if m["id"] == int(memory_id)), None)
+    def retention(self, item: dict, now: datetime.datetime | None = None) -> float:
+        now = now or _now_dt()
+        elapsed = _elapsed_days(_parse_dt(item.get("last_review"), _parse_dt(item.get("time"), now)), now)
+        return ForgettingCurve.retention(item.get("strength", ForgettingCurve.default_strength), elapsed)
     def add(self, content: str, category: str = "fact") -> int:
         with _STATE_LOCK:
+            now = _now_dt()
+            category = str(category).strip() or "fact"
             item = {
                 "id": self._next_id,
-                "time": datetime.date.today().isoformat(),
-                "category": str(category).strip() or "fact",
+                "time": now.date().isoformat(),
+                "category": category,
                 "content": str(content).strip(),
+                "created": _iso(now),
+                "last_review": _iso(now),
+                "reviews": 0,
+                "strength": ForgettingCurve.initial(category),
+                "pinned": False,
+                "dormant": False,
             }
             self.items.append(item)
             self._next_id += 1
+            try:
+                self.vectors.put(item["id"], self.vectors.embed_text(self._embed_text(item)))
+            except Exception as e:
+                # 向量算不出来不该拖垮写记忆，检索时还能按关键词兜底。
+                print(f"[记忆] 向量生成失败（{str(e)[:80]}），该条暂时只能按关键词检索。")
             self._save()
             return item["id"]
     def remove(self, memory_id: int) -> bool:
@@ -369,54 +675,225 @@ class Memory:
             before = len(self.items)
             self.items = [m for m in self.items if m["id"] != memory_id]
             if len(self.items) < before:
+                self.vectors.remove(memory_id)
                 self._save()
                 return True
             return False
-    def search(self, keyword: str = "", limit: int = 50) -> list[dict]:
+    def reinforce(self, memory_id: int, quality: float = 1.0, *, force: bool = False) -> bool:
+        """一次成功的召回就是一次复习。返回是否真的改动了曲线。"""
+        with _STATE_LOCK:
+            item = self.get(memory_id)
+            if item is None:
+                return False
+            now = _now_dt()
+            last = _parse_dt(item.get("last_review"), _parse_dt(item.get("time"), now))
+            if not force and (now - last).total_seconds() < ForgettingCurve.min_review_gap_sec:
+                return False  # 同一回合里反复读到同一条，不算重复复习
+            item["strength"] = ForgettingCurve.reinforce(
+                item.get("strength", ForgettingCurve.default_strength), self.retention(item, now),
+                quality, deliberate=force)
+            item["last_review"] = _iso(now)
+            item["reviews"] = int(item.get("reviews", 0)) + 1
+            item["dormant"] = False
+            return True
+    def pin(self, memory_id: int, pinned: bool = True) -> bool:
+        with _STATE_LOCK:
+            item = self.get(memory_id)
+            if item is None:
+                return False
+            item["pinned"] = bool(pinned)
+            if pinned:
+                item["dormant"] = False
+            self._save()
+            return True
+    def revive(self, memory_id: int) -> bool:
+        """把休眠的记忆重新唤醒，并给它一次结实的复习。"""
+        with _STATE_LOCK:
+            item = self.get(memory_id)
+            if item is None:
+                return False
+            item["dormant"] = False
+            item["strength"] = max(item.get("strength", 0.0), ForgettingCurve.initial(item.get("category", "fact")))
+            self.reinforce(memory_id, quality=1.0, force=True)
+            self._save()
+            return True
+    def sweep(self, now: datetime.datetime | None = None) -> int:
+        """把彻底淡出的记忆转入休眠——只是不再主动想起，绝不删除。"""
+        now = now or _now_dt()
+        changed = 0
+        with _STATE_LOCK:
+            for item in self.items:
+                if item.get("pinned") or item.get("dormant"):
+                    continue
+                age = _elapsed_days(_parse_dt(item.get("created"), now), now)
+                if age < MEMORY_DORMANT_MIN_DAYS:
+                    continue
+                if self.retention(item, now) < MEMORY_FORGET_THRESHOLD:
+                    item["dormant"] = True
+                    changed += 1
+            if changed:
+                self._save()
+        return changed
+    def _ensure_vectors(self, items: list[dict]) -> None:
+        try:
+            # 新的排前面：额度不够时优先保证最近的记忆可被语义检索。
+            ordered = sorted(items, key=lambda m: m["id"], reverse=True)
+            self.vectors.ensure([(m["id"], self._embed_text(m)) for m in ordered])
+        except Exception:
+            pass  # 纯降级路径：没有向量就退回关键词检索
+    def score(self, query: str, item: dict, query_vector: list[float] | None,
+              now: datetime.datetime | None = None) -> dict:
+        """混合打分：语义相似度 + 关键词重合，再按此刻的记忆保持率加权。"""
+        now = now or _now_dt()
+        text = f"{item.get('category', '')} {item.get('content', '')}"
+        raw_keyword = _score_overlap(query, text)
+        if query.strip().lower() in text.lower():
+            raw_keyword += 8
+        keyword = raw_keyword / (raw_keyword + 12.0)  # 压到 0~1，避免长文本刷分
+        semantic = 0.0
+        if query_vector:
+            stored = self.vectors.get(item["id"])
+            if stored:
+                semantic = max(0.0, _cosine(query_vector, stored))
+        base = 0.62 * semantic + 0.38 * keyword if query_vector else keyword
+        retention = self.retention(item, now)
+        # 保持率不清零分数，只压权重：想不太起来 ≠ 完全检索不到。
+        return {
+            "item": item, "semantic": semantic, "keyword": keyword,
+            "retention": retention, "raw_keyword": raw_keyword,
+            "score": base * (0.35 + 0.65 * retention),
+        }
+    # 休眠记忆被强线索唤起的门槛。淡出只是不再「主动想起」，
+    # 一个足够精确的线索仍然应该能把它拽回来——人也是这样。
+    # 门槛必须定得高：_score_overlap 对中文给分很慷慨（两个字就能拿 23 分），
+    # 用原始分做门槛等于任何沾边的查询都能唤醒休眠记忆，遗忘就白做了。
+    # 所以用归一化后的精确度分数——大意是「你得相当具体地叫出它」。
+    cue_keyword = 0.75
+    cue_semantic = 0.45
+    def rank(self, keyword: str, limit: int = 20, *, semantic: bool = True,
+             include_dormant: bool = False) -> list[dict]:
+        query = keyword.strip()
+        pool = self.items if include_dormant else [m for m in self.items if not m.get("dormant")]
+        cue_pool = [] if include_dormant else [m for m in self.items if m.get("dormant")]
+        if not query or not (pool or cue_pool):
+            return []
+        query_vector = None
+        if semantic:
+            self._ensure_vectors(pool + cue_pool)
+            try:
+                query_vector = self.vectors.embed_text(query)
+            except Exception:
+                query_vector = None
+        now = _now_dt()
+        scored = [self.score(query, m, query_vector, now) for m in pool]
+        # 关键词沾边的一律保留；纯向量命中要够像才算，挡住哈希碰撞和嵌入模型的相似度地板。
+        # 门槛取相对值：不同嵌入模型的余弦分布差很远，固定阈值不是过松就是过紧。
+        best = max((row["semantic"] for row in scored), default=0.0)
+        gate = max(0.15, 0.55 * best)
+        hits = [row for row in scored if row["raw_keyword"] > 0 or row["semantic"] >= gate]
+        for row in (self.score(query, m, query_vector, now) for m in cue_pool):
+            if row["keyword"] >= self.cue_keyword or row["semantic"] >= max(self.cue_semantic, gate):
+                row["cued"] = True
+                hits.append(row)
+        hits.sort(key=lambda row: (row["score"], row["item"]["id"]), reverse=True)
+        return hits[:limit]
+    def search(self, keyword: str = "", limit: int = 50, *, semantic: bool = True,
+               include_dormant: bool = False, reinforce: bool = True,
+               quality: float = 1.0) -> list[dict]:
         query = keyword.strip()
         if not query:
-            return list(reversed(self.items[-limit:]))
-        scored: list[tuple[int, dict]] = []
-        for item in self.items:
-            content = f"{item.get('category', '')} {item.get('content', '')}"
-            score = _score_overlap(query, content)
-            if query.lower() in content.lower():
-                score += 8
-            if score > 0:
-                try:
-                    days_old = (datetime.date.today() - datetime.date.fromisoformat(str(item.get("time", datetime.date.today().isoformat())))).days
-                except Exception:
-                    days_old = 30
-                recency_bonus = max(0, 8 - min(8, days_old // 3))
-                score += recency_bonus
-                scored.append((score, item))
-        scored.sort(key=lambda x: (x[0], x[1].get("id", 0)), reverse=True)
-        return [item for _, item in scored[:limit]]
-    def render(self, limit: int = 30) -> str:
-        if not self.items:
+            pool = [m for m in self.items if include_dormant or not m.get("dormant")]
+            return list(reversed(pool[-limit:]))
+        hits = self.rank(query, limit=limit, semantic=semantic, include_dormant=include_dormant)
+        if reinforce and hits:
+            # 只强化真正被端上来的前几条，一次翻 50 条不该让整个库都变结实。
+            # 注意这里不能用 any(生成器)：any 会短路，第一条复习成功后面几条就被跳过了。
+            touched = [self.reinforce(row["item"]["id"], quality) for row in hits[:8]]
+            if any(touched):
+                self._save()
+        return [row["item"] for row in hits]
+    def describe(self, item: dict, now: datetime.datetime | None = None) -> str:
+        retention = self.retention(item, now or _now_dt())
+        flags = "".join(["📌" if item.get("pinned") else "", "💤" if item.get("dormant") else ""])
+        strength = float(item.get("strength", ForgettingCurve.default_strength))
+        return (f"#{item['id']} [{item['category']}] {item['time']} "
+                f"R={retention:.2f} 半衰期={ForgettingCurve.half_life(strength):.1f}天 "
+                f"×{item.get('reviews', 0)}{flags}: {item['content']}")
+    def render(self, limit: int = 30, *, show_curve: bool = False,
+               include_dormant: bool = False) -> str:
+        pool = [m for m in self.items if include_dormant or not m.get("dormant")]
+        if not pool:
             return ""
-        recent = list(reversed(self.items[-limit:]))
+        now = _now_dt()
+        recent = list(reversed(pool[-limit:]))
+        if show_curve:
+            return "\n".join(self.describe(m, now) for m in recent)
         return "\n".join(f"#{m['id']} [{m['category']}] {m['time']}: {m['content']}" for m in recent)
     def brief_context(self, query: str = "", limit: int = 3) -> str:
-        if query.strip():
-            hits = self.search(query, limit=limit)
-        else:
-            hits = list(reversed(self.items[-limit:]))
+        hits = self.search(query, limit=limit)
         if not hits:
             return ""
         return "; ".join(f"#{m['id']} {m['content'][:90]}" for m in hits)
+    def curve_stats(self, now: datetime.datetime | None = None) -> dict:
+        now = now or _now_dt()
+        active = [m for m in self.items if not m.get("dormant")]
+        retentions = [self.retention(m, now) for m in active]
+        return {
+            "total": len(self.items),
+            "active": len(active),
+            "dormant": sum(1 for m in self.items if m.get("dormant")),
+            "pinned": sum(1 for m in self.items if m.get("pinned")),
+            "vivid": sum(1 for r in retentions if r >= 0.7),
+            "fading": sum(1 for r in retentions if r < 0.3),
+            "avg_retention": sum(retentions) / len(retentions) if retentions else 0.0,
+            "embedder": self.vectors.service.signature,
+            "vectors": len(self.vectors.vectors),
+        }
+    def curve_compact(self) -> str:
+        s = self.curve_stats()
+        return (f"{s['active']} 条在线 / {s['dormant']} 条休眠 | 平均保持率 {s['avg_retention']:.0%} | "
+                f"清晰 {s['vivid']} · 正在淡忘 {s['fading']} | 向量 {s['embedder']}")
+    def curve_report(self, limit: int = 8) -> str:
+        now = _now_dt()
+        self.sweep(now)
+        s = self.curve_stats(now)
+        lines = [
+            "【记忆遗忘曲线 R = exp(-t/S)】",
+            f"总计 {s['total']} 条：在线 {s['active']} · 休眠 {s['dormant']} · 常驻 {s['pinned']}",
+            f"平均保持率 {s['avg_retention']:.0%}（清晰 {s['vivid']} 条，正在淡忘 {s['fading']} 条）",
+            f"嵌入后端 {s['embedder']}，已建向量 {s['vectors']} 条",
+        ]
+        active = [m for m in self.items if not m.get("dormant")]
+        if active:
+            ranked = sorted(active, key=lambda m: self.retention(m, now))
+            fading = [m for m in ranked if self.retention(m, now) < 0.6]
+            lines.append("\n最需要复习（保持率 < 60%）：")
+            lines.extend("  " + self.describe(m, now) for m in fading[:limit])
+            if not fading:
+                lines.append("  (暂时没有正在淡忘的记忆)")
+            lines.append("\n记得最牢：")
+            lines.extend("  " + self.describe(m, now) for m in ranked[::-1][:3])
+        dormant = [m for m in self.items if m.get("dormant")]
+        if dormant:
+            lines.append("\n已休眠（不再主动想起，/revive 编号 可唤醒）：")
+            lines.extend("  " + self.describe(m, now) for m in dormant[:limit])
+        return "\n".join(lines)
 MEMORY = Memory()
 @tool
 def remember(content: str, category: str = "fact") -> str:
     """把一条需要跨会话长期保留的事实、偏好或教训写入长期记忆。
     只用于确实值得下次还记得的信息（用户偏好、项目约定、踩过的坑），不要用它记录当前对话里的临时内容。
-    category 建议取 fact / preference / lesson 之一。"""
+    category 决定这条记忆的初始遗忘速度，请认真选：
+    identity（关于用户是谁，半衰期约 21 天）/ preference（长期偏好，约 10 天）/
+    lesson（踩过的坑，约 3.5 天）/ fact（一般事实，约 1 天）。
+    记忆会按艾宾浩斯曲线衰减，但每次被召回都会变得更牢固——重要的东西自然会留下来。"""
     mid = MEMORY.add(content, category)
     return f"已写入长期记忆 #{mid}。"
 @tool
 def recall_memories(keyword: str = "", limit: int = 50) -> str:
-    """按关键词检索长期记忆库，keyword 留空则返回最近写入的记忆。
-    用于回答「我之前说过什么」「之前定的规矩是什么」。
+    """检索长期记忆库：向量语义相似度 + 关键词重合混合排序，并按遗忘曲线加权。
+    keyword 留空则返回最近写入的记忆。用于回答「我之前说过什么」「之前定的规矩是什么」。
+    检索本身就是一次复习——被召回的记忆会自动变得更牢固、更晚淡出。
     注意：只搜跨会话沉淀下来的记忆条目，不搜对话原文——要搜对话原文请用 search_chat_history。"""
     hits = MEMORY.search(keyword, limit=limit)
     if not hits:
@@ -425,8 +902,28 @@ def recall_memories(keyword: str = "", limit: int = 50) -> str:
 @tool
 def forget_memory(memory_id: int) -> str:
     """按编号删除一条长期记忆，编号从 recall_memories 的输出里取。
-    仅在确认某条记忆已经过时或本身就是错的时候使用。"""
+    仅在确认某条记忆已经过时或本身就是错的时候使用。
+    只是「暂时想不起来」不需要删——长期没被想起的记忆会自己进入休眠。"""
     return "已删除该记忆。" if MEMORY.remove(memory_id) else f"未找到记忆 #{memory_id}。"
+@tool
+def memory_status() -> str:
+    """查看长期记忆的遗忘曲线状态：哪些记得清楚、哪些正在淡忘、哪些已经休眠。
+    想知道自己是不是快忘了某件事、或者要不要主动复习一遍的时候用。"""
+    return MEMORY.curve_report()
+@tool
+def reinforce_memory(memory_id: int, pin: bool = False) -> str:
+    """强化一条长期记忆，让它衰减得更慢——相当于主动复习一遍。
+    用户重申某件事、或者某条记忆再次被证明重要时使用；pin=true 则设为常驻，永不休眠。
+    编号从 recall_memories 或 memory_status 的输出里取。"""
+    item = MEMORY.get(memory_id)
+    if item is None:
+        return f"未找到记忆 #{memory_id}。"
+    MEMORY.reinforce(memory_id, quality=1.0, force=True)
+    if pin:
+        MEMORY.pin(memory_id, True)
+    else:
+        MEMORY.persist()
+    return "已强化：" + MEMORY.describe(MEMORY.get(memory_id))
 class TodoList:
     def __init__(self, path: str = TODO_FILE):
         self.path = path
@@ -2067,7 +2564,7 @@ class ProductivityEngine:
         reflection = "Enabled" if getattr(current, "reflect", True) else "Disabled"
         return "\n".join([
             f"Version: {VERSION} ({CODENAME})",
-            f"Memory items: {len(MEMORY.items)}",
+            f"Memory items: {len(MEMORY.items)} ({MEMORY.curve_compact()})",
             f"Workspace files: {len(WORKSPACE.file_index)}",
             f"Python modules: {len(WORKSPACE.import_graph)}",
             f"Mood: {MOOD.label()}",
@@ -2283,7 +2780,8 @@ class MemoryContextProvider(ContextProvider):
     def render(self, user_input: str = "") -> str:
         query = _context_query(user_input)
         if query:
-            hits = MEMORY.search(query, limit=4)
+            # 自动注入是「被动想起」，复习强度给一半：真正张口问出来的召回才算数。
+            hits = MEMORY.search(query, limit=4, quality=0.5)
         else:
             hits = MEMORY.search("", limit=3)
         if not hits:
@@ -3038,6 +3536,8 @@ BUILTIN_TOOLS = [
     remember,
     recall_memories,
     forget_memory,
+    memory_status,
+    reinforce_memory,
     get_mood,
     mood_snapshot,
     mood_diary,
@@ -3758,6 +4258,86 @@ def run_self_tests() -> str:
     except Exception as e:
         checks.append(("tool_descriptions", False, str(e)))
     try:
+        # 遗忘曲线的方向：不复习就衰减；复习会变结实；且必须体现间隔效应——
+        # 刚想起来又想一遍几乎不涨（临时抱佛脚无效），快忘了才复习涨得最多。
+        day0 = ForgettingCurve.retention(1.0, 0.0)
+        day3 = ForgettingCurve.retention(1.0, 3.0)
+        massed = ForgettingCurve.reinforce(4.0, 0.99)
+        spaced = ForgettingCurve.reinforce(4.0, 0.20)
+        ok = day0 > day3 and day3 < 0.1 and spaced > massed >= 4.0
+        checks.append(("memory_curve_math", ok,
+                       f"3天后保持率 {day3:.3f}｜间隔复习 {spaced:.2f}d > 集中复习 {massed:.2f}d"))
+    except Exception as e:
+        checks.append(("memory_curve_math", False, str(e)))
+    try:
+        # 向量召回：相关的排在无关的前面，向量能落盘并按同一嵌入空间读回。
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = (os.path.join(tmp, "m.json"), os.path.join(tmp, "v.json"))
+            mem = Memory(*paths, service=EmbeddingService(mode="local"))
+            hit_id = mem.add("部署脚本要先跑数据库 migration 再重启服务", "lesson")
+            other_id = mem.add("我喜欢喝美式咖啡，不加糖", "preference")
+            query = "部署的时候要注意什么"
+            qvec = mem.vectors.embed_text(query)
+            near = _cosine(qvec, mem.vectors.get(hit_id))
+            far = _cosine(qvec, mem.vectors.get(other_id))
+            self_sim = _cosine(mem.vectors.get(hit_id), mem.vectors.get(hit_id))
+            rows = mem.rank(query, limit=2)
+            # 本地向量不落盘，靠的是哈希确定性：换个进程/实例必须算出同一个向量，
+            # 所以这里验证重算一致（Python 的 hash() 有随机化种子，绝不能用它）。
+            recomputed = Memory(*paths, service=EmbeddingService(mode="local"))
+            recomputed._ensure_vectors(recomputed.items)
+            # 远程向量要落盘，单独验证文件往返。
+            persistent_service = EmbeddingService(mode="local")
+            persistent_service.persistent = True
+            store = VectorStore(paths[1], persistent_service)
+            store.put(hit_id, mem.vectors.get(hit_id))
+            store.save()
+            reloaded = VectorStore(paths[1], persistent_service)
+            roundtrip = reloaded.get(hit_id)
+            ok = (
+                abs(self_sim - 1.0) < 1e-9
+                and near > far
+                and bool(rows) and rows[0]["item"]["id"] == hit_id
+                and recomputed.vectors.get(hit_id) == mem.vectors.get(hit_id)
+                and roundtrip is not None and _cosine(roundtrip, mem.vectors.get(hit_id)) > 0.9999
+            )
+            checks.append(("memory_vector_recall", ok,
+                           f"相关 {near:.3f} > 无关 {far:.3f}｜重算一致 + 落盘往返 OK"))
+    except Exception as e:
+        checks.append(("memory_vector_recall", False, str(e)))
+    try:
+        # 遗忘与休眠：淡出的记忆退出默认召回但绝不删除，常驻记忆永不休眠；
+        # 而且旧版记忆文件升级后不能被一次性判死——升级本身算一次复习。
+        with tempfile.TemporaryDirectory() as tmp:
+            path, vpath = os.path.join(tmp, "m.json"), os.path.join(tmp, "v.json")
+            legacy = {"memories": [{"id": 1, "time": "2020-01-01", "category": "fact", "content": "旧格式的记忆"}]}
+            _atomic_write_text(path, json.dumps(legacy, ensure_ascii=False))
+            mem = Memory(path, vpath, service=EmbeddingService(mode="local"))
+            migrated = len(mem.items) == 1 and not mem.items[0]["dormant"] and mem.retention(mem.items[0]) > 0.9
+            long_ago = _iso(_now_dt() - datetime.timedelta(days=60))
+            faded_id = mem.add("一条会被淡忘的临时记忆", "fact")
+            mem.get(faded_id).update({"created": long_ago, "last_review": long_ago})
+            pinned_id = mem.add("一条常驻的重要记忆", "fact")
+            mem.pin(pinned_id, True)
+            mem.get(pinned_id).update({"created": long_ago, "last_review": long_ago})
+            mem.sweep()
+            kept = len(mem.items) == 3
+            # 泛泛的线索不该把休眠记忆拽回来，否则遗忘等于没做……
+            hidden = all(m["id"] != faded_id for m in mem.search("淡忘", limit=5, reinforce=False))
+            # ……但足够具体地叫出它就该唤起（线索性回忆），显式翻库也一样。
+            cued = any(m["id"] == faded_id
+                       for m in mem.search("一条会被淡忘的临时记忆", limit=5, reinforce=False))
+            findable = any(m["id"] == faded_id
+                           for m in mem.search("淡忘", limit=5, include_dormant=True, reinforce=False))
+            revived = mem.revive(faded_id) and not mem.get(faded_id)["dormant"]
+            ok = migrated and kept and mem.get(faded_id) is not None and hidden and cued and findable and revived
+            ok = ok and not mem.get(pinned_id)["dormant"]
+            checks.append(("memory_forget_sweep", ok,
+                           f"迁移 {'OK' if migrated else 'FAIL'}｜休眠不删除 {'OK' if kept and hidden else 'FAIL'}"
+                           f"｜强线索唤起 {'OK' if cued else 'FAIL'}"))
+    except Exception as e:
+        checks.append(("memory_forget_sweep", False, str(e)))
+    try:
         lines = []
         for name, passed, detail in checks:
             status = "PASS" if passed else "FAIL"
@@ -3804,7 +4384,51 @@ def handle_cli_command(agent: Agent, user_input: str) -> tuple[bool, str | None]
             except ValueError:
                 print("用法：/memory [数量]")
                 return True, None
-        print(MEMORY.render(limit) or "(暂无长期记忆)")
+        print(MEMORY.render(limit, show_curve=True) or "(暂无长期记忆)")
+        print(f"\n{MEMORY.curve_compact()}")
+        return True, None
+    if command == "memstat":
+        print(MEMORY.curve_report())
+        return True, None
+    if command == "recall":
+        keyword, limit = _parse_search_args(args, 6)
+        if not keyword:
+            print("用法：/recall 查询内容 [数量]，例如 /recall 部署流程 5")
+            return True, None
+        rows = MEMORY.rank(keyword, limit=limit)
+        if not rows:
+            print("(没有匹配的记忆)")
+            return True, None
+        now = _now_dt()
+        for row in rows:
+            item = row["item"]
+            print(f"  {row['score']:.3f} (语义 {row['semantic']:.2f} / 关键词 {row['keyword']:.2f} / "
+                  f"保持率 {row['retention']:.2f})  {MEMORY.describe(item, now)}")
+        MEMORY.search(keyword, limit=limit)  # 看过一遍也算复习
+        return True, None
+    if command == "pin":
+        if len(args) == 1 and args[0].isdigit():
+            mid = int(args[0])
+            print(f"已设为常驻记忆，不再衰减：#{mid}" if MEMORY.pin(mid, True) else f"未找到记忆 #{mid}。")
+        else:
+            print("用法：/pin 记忆编号，例如 /pin 3")
+        return True, None
+    if command == "unpin":
+        if len(args) == 1 and args[0].isdigit():
+            mid = int(args[0])
+            print(f"已取消常驻，重新按遗忘曲线衰减：#{mid}" if MEMORY.pin(mid, False) else f"未找到记忆 #{mid}。")
+        else:
+            print("用法：/unpin 记忆编号，例如 /unpin 3")
+        return True, None
+    if command == "revive":
+        if len(args) == 1 and args[0].isdigit():
+            mid = int(args[0])
+            if MEMORY.revive(mid):
+                print("已唤醒：" + MEMORY.describe(MEMORY.get(mid)))
+            else:
+                print(f"未找到记忆 #{mid}。")
+        else:
+            print("用法：/revive 记忆编号，例如 /revive 3")
         return True, None
     if command == "mood":
         print(MOOD.render())
@@ -3981,7 +4605,7 @@ def handle_cli_command(agent: Agent, user_input: str) -> tuple[bool, str | None]
             f"关系：{RELATIONSHIP.compact()}",
             f"世界：{WORKSPACE.compact()}",
             f"生产力：{PRODUCTIVITY.compact()}",
-            f"记忆：{len(MEMORY.items)} 条",
+            f"记忆：{len(MEMORY.items)} 条 | {MEMORY.curve_compact()}",
             f"任务：{len(TODOS.items)} 项",
         ]))
         return True, None
@@ -4008,6 +4632,8 @@ BANNER = """
   /restore   恢复状态快照            /selftest   运行自检
   /remember 写入长期记忆            /doctor     系统诊断
   /forget 编号 删除一条记忆         /reflect    开关自检
+  /recall 语义召回记忆              /memstat    记忆遗忘曲线
+  /pin 编号 记忆设为常驻            /revive 编号 唤醒休眠记忆
   /thought [on|off|preview] 思考轨迹 /persona    人格设定
   /reflection [on|off|preview] 同步心境
   /relationship 关系状态            /trace [n|json] 执行轨迹

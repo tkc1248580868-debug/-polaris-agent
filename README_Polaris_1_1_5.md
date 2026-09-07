@@ -56,10 +56,12 @@ file edit.
 
 ### Self-tests
 
-`/selftest` runs a ten-check suite covering JSON parsing, context building,
+`/selftest` runs a thirteen-check suite covering JSON parsing, context building,
 snapshot round-trip, calculator sandbox escapes, shell guard rules, context
-starvation, step-budget direction, trace wiring, sub-agent isolation, and tool
-description coverage. No API key required.
+starvation, step-budget direction, trace wiring, sub-agent isolation, tool
+description coverage, and three memory checks — curve direction and the spacing
+effect, vector recall with cross-process determinism, and forgetting behaviour
+(dormancy without deletion, cued recall, legacy migration). No API key required.
 
 ### Step budget: direction reversed
 
@@ -87,6 +89,111 @@ means a more careful strategy, not a smaller budget.
   a determined attacker — real isolation means running Polaris in a container or
   under a dedicated low-privilege account.
 - **Sub-agents** no longer write into the main conversation archive or trace tree.
+
+---
+
+## Memory: vectors and the forgetting curve
+
+Long-term memory used to be an append-only log ranked by keyword overlap plus a
+recency bonus. It had no way to tell a hard-won lesson from a throwaway note, and
+nothing ever left the list — so the memory section of the prompt slowly filled up
+with whatever happened to be written most recently.
+
+Memory is now a **vector store on an Ebbinghaus forgetting curve**. Every entry
+decays on its own schedule, and every successful recall makes it decay slower.
+
+### The curve
+
+```
+R = exp(-t / S)
+```
+
+`R` is the probability the memory is still available right now, `t` is days since
+it was last recalled, and `S` is its strength in days. Half-life is `S · ln 2`.
+
+Each recall counts as a review, and strength grows by the **spacing effect**:
+
+```
+S ← S · (1 + 1.8 · quality · (1 − R))
+```
+
+Recall something you just recalled (`R ≈ 1`) and it barely grows — cramming does
+not work here either. Recall something you were about to lose (`R` low) and it
+grows the most. Passive recall (a memory auto-injected into the prompt) counts at
+half quality; an explicit `recall_memories` call counts in full.
+
+New memories start at a strength set by their category, because not all memories
+deserve the same lifespan:
+
+| Category | Initial strength | Half-life |
+|---|---|---|
+| `identity` — who the user is | 30 d | ~21 d |
+| `preference` — long-standing preferences | 14 d | ~10 d |
+| `lesson` — a trap already stepped in | 5 d | ~3.5 d |
+| `fact` — everything else | 1.5 d | ~1 d |
+
+Those numbers are deliberately short. A memory that genuinely matters gets
+recalled, and recall is what makes it permanent — a fact recalled four or five
+times is already good for months.
+
+### Retrieval
+
+Search is hybrid, and retention is a weight rather than a filter:
+
+```
+base  = 0.62 · cosine(query, memory) + 0.38 · keyword_overlap
+score = base · (0.35 + 0.65 · R)
+```
+
+Being hard to recall is not the same as being unreachable, so a fading memory
+that matches well still beats a vivid one that matches poorly.
+
+### Forgetting, and how to undo it
+
+A memory at least three days old that has fallen below 5% retention goes
+**dormant** (both thresholds are configurable).
+Dormant memories drop out of the auto-injected context and out of `/memory` —
+they are **never deleted**. Three ways back:
+
+- A **specific cue** pulls one back on its own (cued recall): a query that matches
+  it precisely still retrieves it, and doing so revives it. A vague query does not
+  — otherwise nothing would ever be forgotten.
+- `/recall <query>` and `recall_memories` can search dormant entries explicitly.
+- `/revive <id>` wakes one; `/pin <id>` makes it permanent and exempt from decay.
+
+`/memstat` shows the whole curve: what is vivid, what is fading, what is asleep.
+
+### Embeddings
+
+Two backends, chosen automatically:
+
+| | `remote` | `local` (fallback) |
+|---|---|---|
+| Source | any OpenAI-compatible `/embeddings` endpoint | pure-Python hashed bag-of-features |
+| Semantics | real — paraphrases match | **lexical only** — shares tokens and character bigrams |
+| Cost | one batched call per new memory set | none |
+| Persisted | yes, to `agent_memory_vectors.json` | no — recomputed on demand |
+
+The local embedder is honest about what it is: a 1024-dimensional signed hash of
+tokens and character bigrams with sublinear term weighting. It will not connect
+"canine" to "dog". It exists so that Polaris keeps working with no API key, no
+network, and no dependencies, and so that a remote outage degrades quietly
+instead of taking memory down with it. If you want real semantic recall, point
+`POLARIS_EMBED_MODEL` at an embedding model.
+
+1024 dimensions is measured, not guessed: at 256, hash collisions crushed the
+cosine of a related Chinese sentence pair from 0.124 to 0.051 and manufactured a
+−0.065 signal between unrelated ones. At 1024 both converge on their
+collision-free values. Local vectors are not persisted because recomputing one
+costs well under a millisecond — far less than the megabytes a dense sidecar
+would cost. Remote vectors are persisted, because those cost money.
+
+### Upgrading
+
+Old `agent_memory.json` files load unchanged. Entries with no curve data are
+treated as reviewed *at upgrade time* rather than at their original write date —
+otherwise every memory older than a few days would go dormant the moment you
+upgraded, and it would look like Polaris had wiped your history.
 
 ---
 
@@ -160,8 +267,11 @@ Every file write is checkpointed first — `/undo` restores the previous version
 
 | Command | Description |
 |---|---|
-| `/memory [n]` · `/remember [-c category] <text>` · `/forget <id>` | Long-term memory |
+| `/memory [n]` · `/remember [-c category] <text>` · `/forget <id>` | Long-term memory, with each entry's retention and half-life |
 | `/searchmem <query>` | Search memory |
+| `/recall <query> [n]` | Vector recall with per-hit semantic / keyword / retention scores |
+| `/memstat` | Forgetting-curve report: vivid, fading, dormant |
+| `/pin <id>` · `/unpin <id>` · `/revive <id>` | Exempt from decay; resume decay; wake a dormant memory |
 | `/history` · `/searchchat` · `/searchlast` | Conversation archive across windows |
 | `/experience` · `/timeline` | Shared history and session timeline |
 
@@ -194,8 +304,15 @@ Every file write is checkpointed first — `/undo` restores the previous version
 | `POLARIS_MONOLOGUE_MAX_TOKENS` | `180` | Monologue length cap. |
 | `POLARIS_SHELL_ALLOW_DANGEROUS` | `false` | Lift the destructive-command block. |
 | `MINIAGENT_PLUGIN_DIRS` | `plugins` | Comma-separated plugin directories. |
+| `POLARIS_EMBED_BACKEND` | `auto` | `auto` · `remote` · `local`. `auto` uses the remote model when an endpoint is configured, else the local hash embedder. |
+| `POLARIS_EMBED_MODEL` | `text-embedding-3-small` | Embedding model for the remote backend. |
+| `POLARIS_EMBED_DIM` | `1024` | Local hash embedder dimensions. Lower is cheaper and less accurate. |
+| `POLARIS_EMBED_BATCH_CAP` | `256` | Max memories embedded per batch — caps the cost of the first search after an import. |
+| `POLARIS_MEMORY_FORGET_THRESHOLD` | `0.05` | Retention below which a memory goes dormant. `0` disables forgetting. |
+| `POLARIS_MEMORY_DORMANT_MIN_DAYS` | `3` | Minimum age before a memory may go dormant. |
 
 State file locations are configurable via `MINIAGENT_MEMORY_FILE`,
+`MINIAGENT_MEMORY_VECTOR_FILE`,
 `MINIAGENT_MOOD_FILE`, `MINIAGENT_PERSONA_FILE`, `MINIAGENT_RELATIONSHIP_FILE`,
 `MINIAGENT_CONVERSATION_FILE`, `MINIAGENT_TODO_FILE`,
 `MINIAGENT_CHECKPOINT_DIR`, and `POLARIS_SNAPSHOT_DIR`.
@@ -208,7 +325,8 @@ State file locations are configurable via `MINIAGENT_MEMORY_FILE`,
 Polaris writes its state into the **current working directory**:
 
 ```
-agent_memory.json         long-term memory
+agent_memory.json         long-term memory + forgetting curve
+agent_memory_vectors.json memory embeddings (remote embedder only)
 agent_mood.json           emotional state + mood journal
 agent_persona.json        personality profile
 agent_relationship.json   relationship with you
@@ -231,7 +349,7 @@ injecting both into the system prompt. `/init` generates a starter file.
 ## Architecture
 
 ```
-main()  ── CLI loop, 38 slash commands
+main()  ── CLI loop, 43 slash commands
   │
   └── Agent.chat()
         ├── MoodState.begin_turn()        emotional state entering the turn
@@ -251,7 +369,8 @@ main()  ── CLI loop, 38 slash commands
 | `MoodState` | `agent_mood.json` | Six dimensions — confidence, focus, fatigue, curiosity, frustration, stability — with damped adjustment, daily decay, and baseline pull |
 | `PersonaProfile` | `agent_persona.json` | Values, habits, speaking style |
 | `RelationshipState` | `agent_relationship.json` | Trust, familiarity, warmth, humor |
-| `Memory` | `agent_memory.json` | Long-term memory with scored retrieval |
+| `Memory` | `agent_memory.json` | Long-term memory on an Ebbinghaus forgetting curve — strength, last recall, review count, pin and dormant flags |
+| `VectorStore` | `agent_memory_vectors.json` | Memory embeddings, keyed by embedder signature; remote vectors only |
 | `ConversationArchive` | `agent_conversations.jsonl` | Cross-window dialogue archive |
 | `WorkspaceModel` | in-memory | File index, AST import graph, git status |
 | `TraceEngine` | in-memory | Execution trace tree |
@@ -259,9 +378,13 @@ main()  ── CLI loop, 38 slash commands
 Mood is not decoration — it is wired into control flow. High fatigue shrinks the
 step budget; high frustration triggers delegation to sub-agents.
 
-**Retrieval** is hand-rolled and dependency-free: token overlap ×3 + character
-bigram overlap ×2 + phrase hit +10 + alias-group bonus +6, with CJK segmented by
-character and bigram. No vector database.
+**Retrieval** is hand-rolled and dependency-free. The keyword channel scores token
+overlap ×3 + character bigram overlap ×2 + phrase hit +10 + alias-group bonus +6,
+with CJK segmented by character and bigram. Memory search blends that with cosine
+similarity over embeddings and weights the result by the entry's current retention
+(see *Memory: vectors and the forgetting curve*). Still no vector database — the
+index is a dict of unit vectors and a dot product, which is the right shape for a
+store that holds hundreds of memories, not millions.
 
 **Extensibility**: MCP servers over stdio, plus a plugin system that loads any
 `plugins/*.py` exposing `register(agent)`, `TOOLS`, or `TOOL`.
@@ -270,7 +393,7 @@ character and bigram. No vector database.
 
 ## Safety
 
-Polaris ships 33 built-in tools, including file writes and shell execution.
+Polaris ships 35 built-in tools, including file writes and shell execution.
 
 - Review generated code before running it.
 - Prefer `plan` or `ask` mode. Reserve `auto` for sandboxes.
@@ -303,9 +426,10 @@ Polaris ships 33 built-in tools, including file writes and shell execution.
 **Shipped in 1.x** — Persona Engine · Mood Engine · Long-Term Memory · Reflection ·
 Workspace Awareness · MCP Support · Plugin System · Productivity Engine ·
 Thought Engine · Experience Model · Relationship State · Reason Engine ·
-Trace Engine · Context Providers · Snapshot Manager
+Trace Engine · Context Providers · Snapshot Manager · Vector memory on an
+Ebbinghaus forgetting curve
 
-**Next** — Internationalization · Persona Engine v2 · Vector memory ·
+**Next** — Internationalization · Persona Engine v2 ·
 Workflow graph · Web UI · Voice interaction
 
 ---
