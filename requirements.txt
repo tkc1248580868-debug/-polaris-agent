@@ -1,0 +1,6 @@
+# Polaris 的全部第三方依赖就这一个。
+# 其余全部来自 Python 标准库——这是有意的设计，不是还没来得及加。
+#
+# openai 只用来访问 OpenAI-Compatible 接口（含 Ollama / LM Studio 等本地服务），
+# 换句话说：装了它，本地离线跑也是这条路。
+openai>=1.0.0

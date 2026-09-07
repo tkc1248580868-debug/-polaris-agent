@@ -1,394 +1,227 @@
-Polaris
+# Polaris
 
-An AI That Grows With You.
+**An AI that grows with you.**
 
-An open-source autonomous AI agent with personality, long-term memory, and continuous growth.
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+![Dependencies](https://img.shields.io/badge/dependencies-1-brightgreen)
+![Single file](https://img.shields.io/badge/single--file-4.7k%20lines-orange)
+![Version](https://img.shields.io/badge/version-1.1.6-lightgrey)
 
-Remember. Reflect. Learn. Grow.
+An open-source autonomous AI agent with a persistent personality, long-term
+memory that actually forgets, and a visible reasoning trail — in **one Python
+file with one dependency**.
 
+Most AI agents are built to complete tasks. Polaris is built to **remember,
+reflect, learn, and grow**. Rather than behaving like a stateless chatbot, it
+maintains an evolving internal state that influences its planning, reasoning,
+and communication.
 
----
-
-Why Polaris?
-
-Most AI agents are built to complete tasks.
-
-Polaris is built to remember, reflect, learn, and grow.
-
-Rather than behaving like a stateless chatbot, Polaris continuously maintains an evolving internal state that influences planning, reasoning, and communication.
-
-Our goal is simple:
-
-Build an AI that becomes better the longer you work with it.
-
+Runs against any OpenAI-compatible endpoint — hosted or local — and keeps its
+entire state in plain JSON files next to your project.
 
 ---
 
-Core Features
-
-Persona Engine
-
-A persistent personality system that goes beyond a static system prompt.
-
-• Persistent identity
-
-• Speaking style
-
-• Internal monologue
-
-• Core values
-
-• Relationship awareness
-
-• Adaptive personality
-
-
----
-
-Mood Engine
-
-A dynamic emotional model that influences reasoning and decision making.
-
-Current emotional dimensions include:
-
-• Confidence
-
-• Focus
-
-• Curiosity
-
-• Fatigue
-
-• Frustration
-
-• Satisfaction
-
-
----
-
-Long-Term Memory
-
-Persistent memory across conversations.
-
-• Memory storage
-
-• Memory search
-
-• Memory editing
-
-• Memory deletion
-
-• Relationship tracking
-
-• Shared experience recording
-
-
----
-
-Workspace Awareness
-
-Understand projects instead of isolated files.
-
-• Workspace indexing
-
-• Project summaries
-
-• Dependency analysis
-
-• File search
-
-• Recent activity tracking
-
-• Context preservation
-
-
----
-
-Autonomous Reasoning
-
-Native autonomous agent workflow.
-
-• Tool calling
-
-• Multi-step planning
-
-• Reflection
-
-• Self-correction
-
-• Todo management
-
-• Internal reasoning
-
-
----
-
-Multi-Agent Collaboration
-
-Delegate complex tasks to lightweight sub-agents.
-
-• Task decomposition
-
-• Parallel execution
-
-• Result aggregation
-
-• Independent reasoning
-
-
----
-
-Native MCP Support
-
-Built-in support for the Model Context Protocol.
-
-• MCP tools
-
-• External services
-
-• Plugin loading
-
-• Extensible integrations
-
-
----
-
-Safety
-
-Designed with reliability in mind.
-
-• Python sandbox
-
-• File checkpoints
-
-• Rollback support
-
-• Permission modes
-
-• Tool validation
-
-
----
-
-Quick Start
-
-Clone the repository.
-
-git clone https://github.com/YOUR_USERNAME/Polaris.git
-
-Install dependencies.
-
+## Quick start
+
+```bash
+git clone https://github.com/tkc1248580868-debug/-polaris-agent.git
+cd ./-polaris-agent
 pip install -r requirements.txt
 
-Run Polaris.
+export OPENAI_API_KEY=sk-...
+python polaris_1_1_6_memorycurve.py
+```
 
-python Polaris.py
+Prefer a local model? No API key needed:
 
+```bash
+export MINIAGENT_BACKEND=ollama        # or: lmstudio
+export MINIAGENT_MODEL=qwen2.5:14b
+python polaris_1_1_6_memorycurve.py
+```
+
+Verify the install without spending a single token:
+
+```
+/selftest
+```
+
+Thirteen checks covering the sandbox, the shell guard, context assembly, the
+trace tree, and the memory curve. No API key required.
+
+**Requirements:** Python 3.10+, and an OpenAI-compatible endpoint.
+Works on Windows, Linux, and macOS. The only dependency is `openai` — every
+other import is from the standard library.
+
+Tested against OpenAI, Gemini, Claude, Ollama, and LM Studio.
 
 ---
 
-Requirements
+## What makes it different
 
-• Python 3.10+
+### Memory on a forgetting curve
 
-• OpenAI-Compatible API
+Most agents' "long-term memory" is an append-only log that grows until it is
+useless. Polaris puts every memory on an **Ebbinghaus forgetting curve**:
 
-• Windows / Linux / macOS
+```
+R = exp(-t / S)
+```
 
-Supported providers:
+Each memory decays on its own schedule, and every time it is recalled it decays
+more slowly — with a real spacing effect, so cramming does not work here either.
+Memories that stop mattering fade out of the prompt on their own; memories that
+keep coming up become permanent. Nothing is ever deleted behind your back —
+faded entries go dormant and a specific enough cue still brings them back.
 
-• OpenAI
+Retrieval is hybrid: cosine similarity over embeddings, blended with keyword
+overlap, weighted by how well the memory is currently retained. Bring your own
+embedding model, or use the built-in pure-Python fallback so it keeps working
+with no API key and no network.
 
-• Gemini
+### An inner life that is wired into control flow
 
-• Claude
+Mood is not decoration. High fatigue shrinks the step budget; high frustration
+triggers delegation to sub-agents. Persona, relationship, and mood shape the
+prompt on every turn — and all three persist across sessions.
 
-• Ollama
+### A visible reasoning trail
 
-• LM Studio
+Every turn writes a structured execution trace you can actually read:
+`/trace` for the timeline, `/trace json` for the whole tree.
 
+### One file, one dependency
+
+4,700 lines of Python, no framework, no vector database, no build step. Copy it
+anywhere and run it.
 
 ---
 
-Polaris Constitution
+## Core features
+
+| Engine | What it does |
+|---|---|
+| **Persona Engine** | Persistent identity, speaking style, core values, adaptive personality |
+| **Mood Engine** | Six dimensions — confidence, focus, curiosity, fatigue, frustration, stability — that feed back into planning |
+| **Memory Engine** | Vector recall on an Ebbinghaus forgetting curve; reinforcement, dormancy, pinning |
+| **Relationship State** | Trust, familiarity, warmth, humor — evolving with every interaction |
+| **Thought Engine** | Internal monologue before acting (template / LLM / hybrid) |
+| **Workspace Awareness** | File index, AST import graph, dependency health, git status |
+| **Trace Engine** | Structured, inspectable execution trace per turn |
+| **Reason Engine** | Risk assessment, step budgeting, delegation strategy |
+| **Productivity Engine** | Goal decomposition, progress journal, statistics |
+| **Experience Model** | Cross-session topics, continuity, shared timeline |
+| **Multi-Agent** | Task decomposition and parallel sub-agents |
+| **MCP + Plugins** | Model Context Protocol over stdio; drop-in `plugins/*.py` |
+| **Safety** | Python sandbox, shell guard, file checkpoints, permission modes |
+
+35 built-in tools. 43 slash commands.
+
+---
+
+## Commands
+
+A few of the ones worth knowing on day one:
+
+| Command | Description |
+|---|---|
+| `/mode plan\|ask\|auto` | Permission mode — how much it may do without asking |
+| `/memory` · `/memstat` | Long-term memory, and its forgetting curve |
+| `/recall <query>` | Semantic recall with per-hit scores |
+| `/pin <id>` · `/revive <id>` | Never forget this; wake a dormant memory |
+| `/trace [n\|json]` | What it actually did last turn |
+| `/mood` · `/persona` · `/relationship` | Its inner state |
+| `/plan <goal>` · `/todo` | Decompose a goal; track progress |
+| `/snapshot` · `/restore <id>` | Save and roll back runtime state |
+| `/undo` | Roll back the last file edit |
+| `/selftest` · `/doctor` | Verify the install; diagnose configuration |
+
+Full reference, architecture notes, and every environment variable:
+**[README_Polaris_1_1_6.md](README_Polaris_1_1_6.md)**
+
+---
+
+## The Polaris Constitution
 
 Every decision made by Polaris is guided by five core principles.
 
-Truth before fluency.
+**Truth before fluency.** Never pretend certainty. If Polaris is unsure, it says so.
 
-Never pretend certainty. If Polaris is unsure, it clearly communicates uncertainty.
+**Verify before acting.** Observe first. Verify assumptions. Then act.
 
-Verify before acting.
+**Preserve user intent.** Always optimize for what the user actually wants.
 
-Observe first. Verify assumptions. Then act.
+**Learn, but never assume.** Adapt gradually without drawing unsupported conclusions.
 
-Preserve user intent.
-
-Always optimize for what the user actually wants.
-
-Learn, but never assume.
-
-Adapt gradually without drawing unsupported conclusions.
-
-Grow through experience.
-
-Every interaction should improve future performance.
-
+**Grow through experience.** Every interaction should improve future performance.
 
 ---
 
-Design Goals
+## Safety
 
-Polaris is designed around several engineering principles.
+Polaris can write files and run shell commands. It ships with a Python sandbox,
+a destructive-command guard, file checkpoints with `/undo`, and three permission
+modes — but none of that makes it safe to point at anything you cannot afford to
+lose.
 
-• Lightweight
+- Review generated code before running it.
+- Apply the principle of least privilege.
+- Run it in a container or under a dedicated low-privilege account for real isolation.
+- Do not use it in safety-critical, medical, legal, or financial settings without
+  independent verification.
+- Keep backups before letting any AI system modify your files.
 
-• Modular
-
-• Extensible
-
-• Local-first compatible
-
-• Long-term memory
-
-• Persistent personality
-
-• Transparent reasoning
-
-• Reliable tool execution
-
+The shell guard stops *accidents in auto mode*, not a determined attacker.
 
 ---
 
-Philosophy
+## Roadmap
 
-We believe future AI systems should be more than task executors.
+**Shipped** — Persona Engine · Mood Engine · Long-Term Memory · Vector memory on
+an Ebbinghaus forgetting curve · Reflection · Workspace Awareness · MCP Support ·
+Plugin System · Productivity Engine · Thought Engine · Experience Model ·
+Relationship State · Reason Engine · Trace Engine · Context Providers ·
+Snapshot Manager
 
-They should understand context.
-
-They should remember shared experiences.
-
-They should learn from mistakes.
-
-They should remain honest about uncertainty.
-
-Most importantly, they should develop a consistent identity over time.
-
-Polaris is our exploration of that future.
-
+**Next** — Internationalization · Persona Engine v2 · Workflow graph · Web UI ·
+Voice interaction
 
 ---
 
-Roadmap
+## Project status
 
-Version 1.x
+Active development. Features, APIs, and internal architecture may change between
+releases.
 
-• Persona Engine
-
-• Mood Engine
-
-• Long-Term Memory
-
-• Reflection
-
-• Workspace Awareness
-
-• MCP Support
-
-• Plugin System
-
-Next Milestones
-
-• Internationalization (i18n)
-
-• Persona Engine v2
-
-• Better Reflection
-
-• Vector Memory
-
-• Workflow Graph
-
-• Web UI
-
-• Voice Interaction
-
+Contributions of all kinds are welcome — bug reports, documentation, ideas, or
+code. Open an issue or a pull request.
 
 ---
 
-Project Status
+## Disclaimer
 
-Active Development
-
-Polaris is under active development.
-
-Features, APIs, and internal architecture may evolve between releases.
-
-Bug reports, feature requests, and contributions are always welcome.
-
+Polaris is an experimental open-source AI agent intended for research, learning,
+and software development. Despite its safety mechanisms it can still generate
+inaccurate information, produce incorrect code, or perform unintended actions.
+You are responsible for reviewing everything it generates before applying it
+anywhere that matters. The maintainers are not liable for any direct or indirect
+damages resulting from its use.
 
 ---
 
-Disclaimer
+## License
 
-Polaris is an experimental open-source AI agent intended for research, learning, and software development.
-
-Although Polaris includes multiple safety mechanisms—including permission modes, reflection, sandboxing, and file checkpoints—it may still generate inaccurate information, produce incorrect code, or perform unintended actions.
-
-Users are responsible for reviewing all generated content, commands, and file modifications before applying them in production environments.
-
-The maintainers of Polaris are not liable for any direct or indirect damages resulting from the use of this software.
-
-Always keep backups of important data before allowing any AI system to modify your files.
-
+[MIT](LICENSE)
 
 ---
 
-Security Notice
+## Vision
 
-No AI system is perfectly secure.
+The future of AI is not simply about answering questions. It is about building
+systems that can remember, reflect, learn, and develop a consistent identity.
 
-Before using Polaris, please remember:
+Polaris isn't trying to become the biggest AI agent. It's trying to become one of
+the most trustworthy ones.
 
-• Review generated code before execution.
-
-• Apply the principle of least privilege.
-
-• Avoid granting unrestricted access to sensitive systems.
-
-• Do not use Polaris in safety-critical, medical, legal, financial, or other high-risk environments without independent verification.
-
-Security is a shared responsibility between the software and its users.
-
-
----
-
-Contributing
-
-Contributions of all kinds are welcome.
-
-Whether you're fixing bugs, improving documentation, proposing new ideas, or building new features, every contribution helps Polaris grow.
-
-If you have suggestions or discover issues, please open an Issue or submit a Pull Request.
-
-
----
-
-License
-
-This project is released under the MIT License.
-
-
----
-
-Vision
-
-The future of AI is not simply about answering questions.
-
-It is about building systems that can remember, reflect, learn, and develop a consistent identity.
-
-Polaris isn't trying to become the biggest AI agent.
-
-It's trying to become one of the most trustworthy ones.
-
-Technology should make AI more capable. Character should make AI more trustworthy.
+*Technology should make AI more capable. Character should make AI more trustworthy.*
