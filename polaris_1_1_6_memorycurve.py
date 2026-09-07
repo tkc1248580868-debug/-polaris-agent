@@ -247,7 +247,13 @@ class OpenAICompatibleBackend(ChatBackend):
             params["response_format"] = response_format
         return self.client.chat.completions.create(**params, stream=stream)
     def create_embeddings(self, *, model: str, inputs: list[str]) -> list[list[float]]:
-        resp = self.client.embeddings.create(model=model, input=inputs)
+        # openai SDK 默认超时是 600 秒。嵌入是写记忆路径上的同步调用，
+        # 真按默认值等下去，一次 remember() 能把整个会话卡住十分钟。
+        # 单独给嵌入一个短超时，超时后由 EmbeddingService 降级到本地向量。
+        client = self.client
+        if EMBED_TIMEOUT > 0 and hasattr(client, "with_options"):
+            client = client.with_options(timeout=EMBED_TIMEOUT)
+        resp = client.embeddings.create(model=model, input=inputs)
         # 返回顺序按 index 排，不依赖服务端保证的顺序。
         rows = sorted(resp.data, key=lambda item: getattr(item, "index", 0))
         return [[float(x) for x in row.embedding] for row in rows]
@@ -282,6 +288,8 @@ EMBED_MODEL = os.environ.get("POLARIS_EMBED_MODEL", "text-embedding-3-small").st
 # 还会给完全无关的句子造出 -0.06 的假信号；1024 维恰好收敛到无碰撞的理想值。
 EMBED_DIM = max(32, int(os.environ.get("POLARIS_EMBED_DIM", "1024")))
 EMBED_BATCH_CAP = max(16, int(os.environ.get("POLARIS_EMBED_BATCH_CAP", "256")))
+# 嵌入请求的超时（秒）。设 0 表示用 SDK 默认值（600 秒，基本等于不超时）。
+EMBED_TIMEOUT = float(os.environ.get("POLARIS_EMBED_TIMEOUT", "30"))
 # 遗忘曲线：R = exp(-t / S)。低于这个保持率且长期没被想起的记忆转入休眠（不删除）。
 MEMORY_FORGET_THRESHOLD = float(os.environ.get("POLARIS_MEMORY_FORGET_THRESHOLD", "0.05"))
 MEMORY_DORMANT_MIN_DAYS = float(os.environ.get("POLARIS_MEMORY_DORMANT_MIN_DAYS", "3"))
@@ -3976,12 +3984,12 @@ class Agent:
                 TRACE_ENGINE.finish(summary) if ok else TRACE_ENGINE.fail(f"失败 | {output.splitlines()[0][:80] if output else ''}")
             preview = output.replace("\n", " ")
             print(f"{self.tag}  [结果] {preview[:150]}...\n")
-            fn = self.tools.get(name)
+            dangerous, mutating = self._tool_flags(name)
             MOOD.record_tool(
                 name,
                 success=ok,
-                mutating=bool(getattr(fn, "mutating", False)),
-                dangerous=bool(getattr(fn, "dangerous", False)),
+                mutating=mutating,
+                dangerous=dangerous,
                 output=output,
             )
             self.messages.append(
@@ -3993,30 +4001,64 @@ class Agent:
                 }
             )
             self._trim_messages()
-    def _execute(self, name: str, args: dict) -> tuple[str, bool]:
+    def _mcp_lookup(self, name: str) -> tuple[Any, str, dict] | None:
+        """把对外暴露的工具名映射回 (服务器, 原始工具名, 工具定义)。"""
         mcp_srv = self._mcp_tool_map.get(name)
-        if mcp_srv is not None:
-            orig_name = name
-            for t in mcp_srv.tools:
-                mapped = t["name"]
-                if mapped in self.tools:
-                    mapped = f"mcp_{mcp_srv.name}_{t['name']}"
-                if mapped == name:
-                    orig_name = t["name"]
-                    break
+        if mcp_srv is None:
+            return None
+        for t in mcp_srv.tools:
+            mapped = t["name"]
+            if mapped in self.tools:
+                mapped = f"mcp_{mcp_srv.name}_{t['name']}"
+            if mapped == name:
+                return mcp_srv, t["name"], t
+        return mcp_srv, name, {}
+    def _tool_flags(self, name: str) -> tuple[bool, bool]:
+        """返回 (dangerous, mutating)，本地工具和 MCP 工具统一从这里取。
+
+        MCP 工具是另一个进程里的未知代码，本地的 @tool 标注管不到它，
+        所以默认按最危险处理——宁可多问一次，也不能让 plan 模式下
+        一个外部服务器悄悄写文件。只有服务端明确声明了 MCP 规范里的
+        readOnlyHint / destructiveHint 才放宽，且这两个 hint 是服务器
+        自己给的提示、不是保证，只用于降噪，不作为安全边界。"""
+        found = self._mcp_lookup(name)
+        if found is not None:
+            annotations = found[2].get("annotations") or {}
+            if not isinstance(annotations, dict):
+                annotations = {}
+            if annotations.get("readOnlyHint") is True:
+                return False, False
+            if annotations.get("destructiveHint") is False:
+                return False, True
+            return True, True
+        fn = self.tools.get(name)
+        return bool(getattr(fn, "dangerous", False)), bool(getattr(fn, "mutating", False))
+    def _permission_denied(self, name: str) -> str | None:
+        """权限闸门。返回拒绝原因，None 表示放行。"""
+        dangerous, mutating = self._tool_flags(name)
+        if self.mode == "plan" and mutating:
+            return "Plan模式锁定了写操作，请先切换模式。"
+        if self.mode == "ask" and (dangerous or mutating):
+            if input(f"{self.tag}  [!] 确认执行该操作？[y/N] ").strip().lower() != "y":
+                return "用户拒绝调用该工具。"
+        return None
+    def _execute(self, name: str, args: dict) -> tuple[str, bool]:
+        found = self._mcp_lookup(name)
+        fn = self.tools.get(name)
+        if found is None and fn is None:
+            return f"未知工具: {name}", False
+        # 闸门必须在分发之前。旧实现把 MCP 调用直接 return 掉了，
+        # 结果 plan/ask 两种模式对 MCP 工具完全失效——外部服务器可以
+        # 在「只读」模式下随意写盘，而且一次都不会问用户。
+        denial = self._permission_denied(name)
+        if denial:
+            return denial, False
+        if found is not None:
+            mcp_srv, orig_name, _ = found
             try:
-                output = mcp_srv.call_tool(orig_name, args)
-                return output, True
+                return mcp_srv.call_tool(orig_name, args), True
             except Exception:
                 return traceback.format_exc(limit=2), False
-        fn = self.tools.get(name)
-        if not fn:
-            return f"未知工具: {name}", False
-        if self.mode == "plan" and getattr(fn, "mutating", False):
-            return "Plan模式锁定了写操作，请先切换模式。", False
-        if self.mode == "ask" and (getattr(fn, "dangerous", False) or getattr(fn, "mutating", False)):
-            if input(f"{self.tag}  [!] 确认执行该操作？[y/N] ").strip().lower() != "y":
-                return "用户拒绝调用该工具。", False
         prev_context = CURRENT_AGENT_CONTEXT.copy()
         CURRENT_AGENT_CONTEXT.update(
             {
@@ -4338,6 +4380,58 @@ def run_self_tests() -> str:
     except Exception as e:
         checks.append(("memory_forget_sweep", False, str(e)))
     try:
+        # MCP 工具必须和本地工具走同一道权限闸门。
+        # 回归测试：旧实现在 _execute 里直接 return 掉 MCP 调用，
+        # plan/ask 两种模式对外部服务器完全失效。
+        class _FakeMCPServer:
+            name = "fake"
+            tools = [
+                {"name": "write_thing", "description": "writes something"},
+                {"name": "read_thing", "description": "reads", "annotations": {"readOnlyHint": True}},
+            ]
+            def __init__(self):
+                self.called: list[str] = []
+            def call_tool(self, tool_name: str, args: dict) -> str:
+                self.called.append(tool_name)
+                return "ok"
+        srv = _FakeMCPServer()
+        probe = Agent.__new__(Agent)  # 绕开 __init__，自检不该需要后端或 API key
+        probe.tools, probe.tag, probe.mode = {}, "", "plan"
+        probe.mcp_servers = {"fake": srv}
+        probe._mcp_tool_map = {"write_thing": srv, "read_thing": srv}
+        out, ok = probe._execute("write_thing", {})
+        blocked = (not ok) and "Plan" in out and srv.called == []
+        # 声明了 readOnlyHint 的工具在 plan 模式下应当放行
+        _, ok_read = probe._execute("read_thing", {})
+        readonly_pass = ok_read and srv.called == ["read_thing"]
+        # 未声明的 MCP 工具默认按最危险处理
+        flags_ok = probe._tool_flags("write_thing") == (True, True) and probe._tool_flags("read_thing") == (False, False)
+        checks.append(("mcp_permission_gate", blocked and readonly_pass and flags_ok,
+                       f"plan 拦截 {'OK' if blocked else 'FAIL'}｜只读放行 {'OK' if readonly_pass else 'FAIL'}"))
+    except Exception as e:
+        checks.append(("mcp_permission_gate", False, str(e)))
+    try:
+        # 嵌入请求必须带自己的超时：它在写记忆的同步路径上，
+        # 用 SDK 默认的 600 秒等于一次 remember() 能卡死十分钟。
+        class _Row:
+            def __init__(self, i): self.index, self.embedding = i, [0.1, 0.2]
+        class _FakeClient:
+            def __init__(self): self.timeout = None
+            def with_options(self, timeout=None):
+                self.timeout = timeout
+                return self
+            @property
+            def embeddings(self): return self
+            def create(self, model=None, input=None):
+                return type("R", (), {"data": [_Row(i) for i in range(len(input))]})()
+        backend = OpenAICompatibleBackend.__new__(OpenAICompatibleBackend)
+        backend.client = _FakeClient()
+        rows = backend.create_embeddings(model="m", inputs=["a", "b"])
+        ok = len(rows) == 2 and backend.client.timeout == EMBED_TIMEOUT and EMBED_TIMEOUT > 0
+        checks.append(("embedding_timeout", ok, f"超时 {backend.client.timeout}s"))
+    except Exception as e:
+        checks.append(("embedding_timeout", False, str(e)))
+    try:
         lines = []
         for name, passed, detail in checks:
             status = "PASS" if passed else "FAIL"
@@ -4585,15 +4679,20 @@ def handle_cli_command(agent: Agent, user_input: str) -> tuple[bool, str | None]
         print(f"自我反思已{'开启' if agent.reflect else '关闭'}。")
         return True, None
     if command == "tools":
+        def _flag_suffix(dangerous: bool, mutating: bool) -> str:
+            flags = (["需确认"] if dangerous else []) + (["写操作"] if mutating else [])
+            return f"（{'/'.join(flags)}）" if flags else ""
         for t in agent.tools.values():
             first_line = t.schema["description"].splitlines()[0]
-            flags = []
-            if getattr(t, "dangerous", False):
-                flags.append("需确认")
-            if getattr(t, "mutating", False) and "写操作" not in flags:
-                flags.append("写操作")
-            suffix = f"（{'/'.join(flags)}）" if flags else ""
+            suffix = _flag_suffix(getattr(t, "dangerous", False), getattr(t, "mutating", False))
             print(f"  - {t.schema['name']}{suffix}: {first_line}")
+        # MCP 工具以前在这里完全不显示，但模型是看得见也调得动的——
+        # 用户无从知道自己接进来的服务器给了模型哪些能力。
+        for name in agent._mcp_tool_map:
+            found = agent._mcp_lookup(name)
+            desc = (found[2].get("description") or "").splitlines()
+            suffix = _flag_suffix(*agent._tool_flags(name))
+            print(f"  - {name}{suffix} [MCP]: {desc[0] if desc else '(无描述)'}")
         return True, None
     if command == "doctor":
         print("\n".join([

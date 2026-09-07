@@ -165,12 +165,13 @@ file edit.
 
 ### Self-tests
 
-`/selftest` runs a thirteen-check suite covering JSON parsing, context building,
+`/selftest` runs a fifteen-check suite covering JSON parsing, context building,
 snapshot round-trip, calculator sandbox escapes, shell guard rules, context
 starvation, step-budget direction, trace wiring, sub-agent isolation, tool
 description coverage, and three memory checks — curve direction and the spacing
 effect, vector recall with cross-process determinism, and forgetting behaviour
-(dormancy without deletion, cued recall, legacy migration). No API key required.
+(dormancy without deletion, cued recall, legacy migration), the MCP permission
+gate, and the embedding timeout. No API key required.
 
 ### Step budget: direction reversed
 
@@ -198,6 +199,14 @@ means a more careful strategy, not a smaller budget.
   a determined attacker — real isolation means running Polaris in a container or
   under a dedicated low-privilege account.
 - **Sub-agents** no longer write into the main conversation archive or trace tree.
+- **MCP tools go through the same permission gate as local tools.** They used to
+  be dispatched before the `plan` / `ask` checks ran, so an external server could
+  write files in supposedly read-only mode and never prompt. Tools from an MCP
+  server are now treated as dangerous *and* mutating by default; a server may
+  declare `readOnlyHint` / `destructiveHint` to relax that, but those are hints
+  for noise reduction, not a security boundary. `/tools` lists MCP tools and
+  their flags too — previously the model could see and call them while the user
+  could not.
 
 ---
 
@@ -312,6 +321,7 @@ Every file write is checkpointed first — `/undo` restores the previous version
 | `POLARIS_EMBED_MODEL` | `text-embedding-3-small` | Embedding model for the remote backend. |
 | `POLARIS_EMBED_DIM` | `1024` | Local hash embedder dimensions. Lower is cheaper and less accurate. |
 | `POLARIS_EMBED_BATCH_CAP` | `256` | Max memories embedded per batch — caps the cost of the first search after an import. |
+| `POLARIS_EMBED_TIMEOUT` | `30` | Seconds before an embedding request is abandoned and the local embedder takes over. `0` uses the SDK default (600s). |
 | `POLARIS_MEMORY_FORGET_THRESHOLD` | `0.05` | Retention below which a memory goes dormant. `0` disables forgetting. |
 | `POLARIS_MEMORY_DORMANT_MIN_DAYS` | `3` | Minimum age before a memory may go dormant. |
 
