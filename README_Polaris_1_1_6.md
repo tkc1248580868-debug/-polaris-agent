@@ -165,13 +165,15 @@ file edit.
 
 ### Self-tests
 
-`/selftest` runs a fifteen-check suite covering JSON parsing, context building,
+`/selftest` runs a nineteen-check suite covering JSON parsing, context building,
 snapshot round-trip, calculator sandbox escapes, shell guard rules, context
 starvation, step-budget direction, trace wiring, sub-agent isolation, tool
 description coverage, and three memory checks — curve direction and the spacing
 effect, vector recall with cross-process determinism, and forgetting behaviour
 (dormancy without deletion, cued recall, legacy migration), the MCP permission
-gate, and the embedding timeout. No API key required.
+gate, the embedding timeout, file paging, shell exit-code reporting, streaming
+tool-call assembly, and whether the chain of thought is actually causal.
+No API key required.
 
 ### Step budget: direction reversed
 
@@ -199,6 +201,19 @@ means a more careful strategy, not a smaller budget.
   a determined attacker — real isolation means running Polaris in a container or
   under a dedicated low-privilege account.
 - **Sub-agents** no longer write into the main conversation archive or trace tree.
+- **`read_file` can read a whole file.** It used to cut off at 8,000 characters
+  with no way to continue — the agent went blind after ~175 lines and had no way
+  to know it. It now takes `offset` / `limit`, returns numbered lines that line up
+  with `search_files`, and says how many lines remain.
+- **`run_shell` always reports the exit code**, with stdout and stderr labelled
+  separately. It used to include the exit code only when there was *no* output,
+  which threw away the one signal a coding agent needs most: did the tests pass?
+  A non-zero exit now also registers as a failure in the trace, the mood system,
+  and self-reflection.
+- **Streaming tool-call assembly** survives providers that send the id in a later
+  chunk or omit `function` from the first one. Both used to break — a crash in one
+  case, a null `tool_call_id` in the other — and both are more common on
+  OpenAI-compatible servers than on OpenAI itself.
 - **MCP tools go through the same permission gate as local tools.** They used to
   be dispatched before the `plan` / `ask` checks ran, so an external server could
   write files in supposedly read-only mode and never prompt. Tools from an MCP
@@ -207,6 +222,33 @@ means a more careful strategy, not a smaller budget.
   for noise reduction, not a security boundary. `/tools` lists MCP tools and
   their flags too — previously the model could see and call them while the user
   could not.
+
+---
+
+## Thinking, for real
+
+Polaris used to print an "inner monologue" before each turn. It was theatre: a
+separately generated block of text that was printed and then **thrown away**. It
+never entered the message history, so it could not influence a single downstream
+decision — and in `hybrid` mode it cost a whole extra API call to produce.
+
+It is now an actual chain of thought.
+
+Before answering or calling a tool, the model writes its reasoning in a
+`<thinking>` block: what it knows, what it is missing, why this step, what could
+go wrong. That block **stays in the conversation**, so every later step is built
+on top of it. It is shown to you on its own channel, and stripped from the final
+answer.
+
+Where the endpoint exposes native reasoning tokens (`reasoning_content` — DeepSeek-R1,
+QwQ, vLLM and friends), that is captured directly instead: the model's own
+reasoning, at no extra cost and with no prompting required.
+
+The difference is causal, not cosmetic, and `/selftest` checks exactly that: the
+reasoning must appear in the message history and must not appear in the answer.
+
+The old behaviour is still available — `POLARIS_MONOLOGUE_MODE=template` for the
+offline flavour text, `llm` or `hybrid` for the pre-1.1.6 extra-call version.
 
 ---
 
@@ -312,7 +354,7 @@ Every file write is checkpointed first — `/undo` restores the previous version
 | `MINIAGENT_SKIP_GATE` | `false` | Skip the startup readiness check. |
 | `MINIAGENT_SHOW_THOUGHT` | `true` | Print the inner monologue. |
 | `MINIAGENT_THOUGHT_STYLE` | `balanced` | Thinking style. |
-| `POLARIS_MONOLOGUE_MODE` | `hybrid` | `template` · `llm` · `hybrid` · `tag` |
+| `POLARIS_MONOLOGUE_MODE` | `cot` | `cot` (real chain of thought) · `template` (offline flavour, no API call) · `llm` / `hybrid` (legacy: a separate call whose output never reaches the answer) |
 | `POLARIS_MONOLOGUE_MODEL` | (main model) | Separate model for the monologue. |
 | `POLARIS_MONOLOGUE_MAX_TOKENS` | `180` | Monologue length cap. |
 | `POLARIS_SHELL_ALLOW_DANGEROUS` | `false` | Lift the destructive-command block. |

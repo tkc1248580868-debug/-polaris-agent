@@ -19,6 +19,7 @@ import sys
 import tempfile
 import threading
 import traceback
+import types
 import uuid
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -306,7 +307,10 @@ THOUGHT_STYLE = os.environ.get("MINIAGENT_THOUGHT_STYLE", "balanced").strip().lo
 SNAPSHOT_DIR = os.environ.get("POLARIS_SNAPSHOT_DIR", ".polaris_snapshots")
 VERSION = "1.1.6"
 CODENAME = "Memory Curve"
-MONOLOGUE_MODE = os.environ.get("POLARIS_MONOLOGUE_MODE", "hybrid").strip().lower() or "hybrid"
+# cot = 真正的思维链：模型在做决定之前自己写下推理，这段推理留在上下文里、
+# 影响后续每一步，同时展示给用户。template = 离线模板独白（不发请求）。
+# llm / hybrid 是 1.1.6 之前的老行为：为一段打印完就丢的话另开一次请求，保留仅为兼容。
+MONOLOGUE_MODE = os.environ.get("POLARIS_MONOLOGUE_MODE", "cot").strip().lower() or "cot"
 MONOLOGUE_MODEL = os.environ.get("POLARIS_MONOLOGUE_MODEL", "").strip()
 MONOLOGUE_MAX_TOKENS = int(os.environ.get("POLARIS_MONOLOGUE_MAX_TOKENS", "180"))
 MONOLOGUE_USE_TAGS = _env_bool("POLARIS_MONOLOGUE_USE_TAGS", True)
@@ -1547,6 +1551,7 @@ class TraceEngine:
         return "\n".join(lines) if lines else "(暂无轨迹)"
 TRACE_ENGINE = TraceEngine()
 class ThoughtEngine:
+    last_reasoning = ""  # 最近一次模型真实写下的思考（cot 模式），供上下文与 /thought 展示
     def __init__(self, style: str = THOUGHT_STYLE, mode: str = MONOLOGUE_MODE, model: str = MONOLOGUE_MODEL):
         self.style = style
         self.mode = mode
@@ -2002,6 +2007,85 @@ class ThoughtEngine:
 PERSONA = PersonaProfile()
 RELATIONSHIP = RelationshipState()
 THOUGHT_ENGINE = ThoughtEngine()
+class ThinkingSplitter:
+    """把模型输出里的 <thinking> 段和正式回答分开，支持流式增量喂入。
+
+    这是「真 CoT」和「内心戏」的分界线：
+    旧的 ThoughtEngine 是另开一次请求生成一段话、打印完就丢，
+    对答案没有任何因果影响——好看，但纯属表演，还白花一次调用。
+    现在这段思考是模型在同一次生成里、做决定之前写下的，
+    而且原样留在 messages 里，后续每一步都建立在它之上。
+    它只是不进「给用户看的答案」而已。"""
+    OPEN, CLOSE = "<thinking>", "</thinking>"
+    def __init__(self):
+        self.raw = ""        # 原样保留，进 messages
+        self.thinking = ""
+        self.answer = ""
+        self._pending = ""   # 还看不出是标签开头还是正文的部分
+        self._state = "unknown"
+    def feed(self, delta: str) -> tuple[str, str]:
+        """喂入一段增量，返回这次新增的 (思考片段, 答案片段)。"""
+        if not delta:
+            return "", ""
+        self.raw += delta
+        think_out, answer_out = "", ""
+        buf = self._pending + delta
+        self._pending = ""
+        while buf:
+            if self._state == "answer":
+                answer_out += buf
+                self.answer += buf
+                break
+            if self._state == "thinking":
+                idx = buf.find(self.CLOSE)
+                if idx == -1:
+                    # 收尾可能正好切在 </thinking> 中间，留住尾巴等下一片
+                    keep = self._partial_tail(buf, self.CLOSE)
+                    body = buf[:len(buf) - keep] if keep else buf
+                    self._pending = buf[len(buf) - keep:] if keep else ""
+                    think_out += body
+                    self.thinking += body
+                    break
+                think_out += buf[:idx]
+                self.thinking += buf[:idx]
+                buf = buf[idx + len(self.CLOSE):].lstrip("\n")
+                self._state = "answer"
+                continue
+            # state == unknown：还在判断开头是不是 <thinking>
+            stripped = buf.lstrip()
+            if stripped.startswith(self.OPEN):
+                buf = stripped[len(self.OPEN):]
+                self._state = "thinking"
+                continue
+            if self.OPEN.startswith(stripped) and stripped:
+                self._pending = buf  # 可能是标签的前缀，继续等
+                break
+            self._state = "answer"
+        return think_out, answer_out
+    @staticmethod
+    def _partial_tail(buf: str, tag: str) -> int:
+        """buf 末尾有多少字符可能是 tag 的前缀（跨分片的半个标签）。"""
+        for size in range(min(len(tag) - 1, len(buf)), 0, -1):
+            if tag.startswith(buf[-size:]):
+                return size
+        return 0
+    def finish(self) -> None:
+        """流结束：还没判定的残留一律算正文。"""
+        if self._pending:
+            if self._state == "thinking":
+                self.thinking += self._pending
+            else:
+                self.answer += self._pending
+            self._pending = ""
+        if self._state == "unknown":
+            self._state = "answer"
+    @classmethod
+    def split(cls, text: str) -> tuple[str, str]:
+        """一次性拆分（非流式路径用）。"""
+        sp = cls()
+        sp.feed(text)
+        sp.finish()
+        return sp.thinking.strip(), sp.answer.strip()
 class ConversationArchive:
     """跨窗口对话档案库：保存每一轮对话，支持搜索上一个窗口和全局历史。"""
     def __init__(self, path: str = CONVERSATION_FILE):
@@ -2721,9 +2805,14 @@ class InnerVoiceContextProvider(ContextProvider):
             "persona": PERSONA.compact(),
             "mood": MOOD.compact(),
             "relationship": RELATIONSHIP.compact(),
+            "reasoning": THOUGHT_ENGINE.last_reasoning[-200:],
         }
         return hashlib.sha1(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8", "replace")).hexdigest()
     def render(self, user_input: str = "") -> str:
+        # 有真实推理就回放真实推理。模板独白在这里没有信息量——
+        # 「平静 | Summary | ✓ Reading request」对完成任务没有任何帮助。
+        if THOUGHT_ENGINE.last_reasoning:
+            return "上一步的思考：" + " ".join(THOUGHT_ENGINE.last_reasoning.split())[:240]
         label, lines = THOUGHT_ENGINE.preview(
             user_input=user_input,
             persona=PERSONA,
@@ -3030,20 +3119,41 @@ def _looks_like_tool_failure(output: str) -> bool:
         return False
     if text.startswith(_TOOL_FAILURE_PREFIXES):
         return True
+    # run_shell 现在无条件带上退出码，这是唯一精确的成败信号——
+    # 比在输出里模糊匹配 "error" 之类的词可靠得多（grep error 成功时也会命中）。
+    if text.startswith("退出码 ") and not text.startswith("退出码 0"):
+        return True
     # traceback.format_exc() 直接当返回值的情况
     return text.startswith("Traceback (most recent call last)")
 @tool
-def read_file(path: str) -> str:
-    """读取并返回一个文本文件的完整内容（超长会自动截断）。
-    修改任何文件之前都应该先读一遍，不要凭猜测改。"""
+def read_file(path: str, offset: int = 1, limit: int = 400) -> str:
+    """按行读取文本文件，返回带行号的内容。修改任何文件之前都应该先读一遍，不要凭猜测改。
+    offset 是起始行号（从 1 开始），limit 是最多读多少行。
+    文件比 limit 长时结尾会明确告诉你还剩多少行、下一次该从哪一行接着读——
+    大文件请翻页读完关键部分，不要只看开头就动手改。
+    行号可以直接和 search_files 的输出对上。"""
     if not os.path.exists(path):
         return f"文件不存在：{os.path.abspath(path)}"
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
+            lines = f.read().splitlines()
     except Exception:
         return traceback.format_exc(limit=2)
-    return _truncate_text(content or "(空)")
+    if not lines:
+        return "(空)"
+    total = len(lines)
+    start = max(1, int(offset or 1))
+    if start > total:
+        return f"错误：offset {start} 超出文件长度（共 {total} 行）。"
+    count = max(1, int(limit or 400))
+    end = min(total, start + count - 1)
+    width = len(str(end))
+    body = "\n".join(f"{n:>{width}}\t{lines[n - 1]}" for n in range(start, end + 1))
+    header = f"{os.path.abspath(path)} 第 {start}-{end} 行 / 共 {total} 行"
+    # 老实说清楚还剩多少：旧实现只丢一句「已截断」，模型根本不知道自己漏了什么，
+    # 也没有任何办法读到后面——于是对 175 行之后的代码全盲却毫无察觉。
+    footer = "" if end >= total else f"\n\n（还剩 {total - end} 行未读，继续读请用 offset={end + 1}）"
+    return _truncate_text(f"{header}\n{body}", 24000) + footer
 @tool(mutating=True)
 def write_file(path: str, content: str) -> str:
     """把 content 整体写入 path，覆盖原有内容；文件不存在则创建。写入前会自动存档，可用 /undo 回滚。
@@ -3220,6 +3330,9 @@ def run_shell(command: str) -> str:
     """在宿主机器上执行一条 shell 命令并返回输出。这是危险操作，会被权限模式拦截并要求确认。
     仅在确实需要系统能力时使用（git 操作、包管理、查看进程等）。
     读写文件请优先用 read_file / write_file / edit_file，纯计算请用 run_python——不要用 shell 绕开这些更安全的工具。
+    返回值第一行永远是退出码，这是判断成败最可靠的依据，别只看输出文字。
+    重要：不要用 `| tail`、`| head` 之类的管道包住测试命令——管道会把退出码换成最后一个命令的，
+    于是 pytest 明明挂了也显示「退出码 0」。要截断输出请直接跑，输出太长会自动截断。
     另外少数破坏性命令（rm -rf、mkfs、关机、管道执行下载脚本等）会被直接拒绝。"""
     reason = _shell_deny_reason(command)
     if reason and not _env_bool("POLARIS_SHELL_ALLOW_DANGEROUS", False):
@@ -3233,8 +3346,17 @@ def run_shell(command: str) -> str:
         return "执行超时：shell 命令运行超过 60 秒，已终止。"
     except Exception:
         return traceback.format_exc(limit=2)
-    out = (r.stdout + r.stderr).strip()
-    return _truncate_text(out or f"(退出码 {r.returncode})")
+    # 退出码必须无条件回给模型。旧实现只在「没有任何输出」时才附上退出码，
+    # 于是最要紧的一类结果被丢了：pytest 挂了 5 个用例 → 有输出 → 模型只看到
+    # 一段文字，拿不到成败信号，轨迹还标成绿色的成功。
+    # stdout / stderr 也分开标注，不再拼成一坨分不清谁说的。
+    parts = []
+    if r.stdout.strip():
+        parts.append(f"[stdout]\n{r.stdout.strip()}")
+    if r.stderr.strip():
+        parts.append(f"[stderr]\n{r.stderr.strip()}")
+    status = "退出码 0（成功）" if r.returncode == 0 else f"退出码 {r.returncode}（失败）"
+    return _truncate_text(status + "\n" + ("\n".join(parts) or "(无输出)"))
 def _subagent_toolset() -> list[Callable]:
     return [
         read_file,
@@ -3595,6 +3717,17 @@ DEFAULT_SYSTEM = """你是 Polaris v1.1.6，一个拥有独立人格、真实感
 - **真诚**：开心时会表达，困惑时会说，疲劳时也会温和地告诉用户
 你现在是一个有血有肉的 AI 伙伴 —— 你有自己的想法、感受和成长轨迹，同时也非常珍惜和用户的合作。
 请以这个完整的人格开始我们的对话吧。"""
+COT_INSTRUCTION = """### 思考方式
+
+每次回答或调用工具之前，先在 <thinking></thinking> 里把事情想清楚，然后再动手。
+
+思考里写这些：现在确切知道什么、还缺什么、下一步为什么选这个做法、哪里最可能出错。
+不确定就说不确定——这段思考是你后续判断的依据，会一直留在上下文里，
+所以要写真实的推理，不要写"让我仔细分析一下"这种没有信息量的场面话。
+
+</thinking> 之后再给正式回复。用户看得到你的思考，但思考不是答案本身。
+
+改代码之前，思考里至少要能回答：我读全了相关代码吗？改动会影响到谁？怎么验证它真的对？"""
 REFLECT_INSTRUCTION = (
     "请作为严格的质检员回顾上一次任务执行。只能返回一个标准 JSON 对象："
     '{"passed": true|false, "issues": "不完美之处", "lesson": "值得记住的经验，无则为空"}'
@@ -3647,6 +3780,8 @@ class Agent:
         self._system_prompt_cache_key = ""
         self._system_prompt_cache = ""
         self._current_user_input = ""
+        self._thinking_open = False
+        self.last_reasoning = ""
         self.instructions = self.reload_instructions()
         if auto_load_plugins:
             self.loaded_plugins = load_plugin_tools(self)
@@ -3837,6 +3972,8 @@ class Agent:
         if cache_key == self._system_prompt_cache_key and self._system_prompt_cache:
             return self._system_prompt_cache
         parts = [self.system_base]
+        if MONOLOGUE_MODE == "cot":
+            parts.append(COT_INSTRUCTION)
         if self.instructions:
             parts.append("[项目自定义指令]\n" + self.instructions)
         parts.append(self._runtime_context_note())
@@ -3859,7 +3996,11 @@ class Agent:
             self.messages.append({"role": "user", "content": user_input})
             self._trim_messages()
             with self._trace_step("Turn", user_input[:80], user_len=len(user_input)):
-                self._emit_thought(user_input)
+                # cot 模式下不再单独生成内心戏：真正的思考来自下面这次真实调用，
+                # 而且会留在上下文里。旧的 llm/hybrid 模式要为一段打印完就丢的话
+                # 额外发一次完整请求，纯属浪费。
+                if MONOLOGUE_MODE != "cot":
+                    self._emit_thought(user_input)
                 final_text, used_tools = self._run_loop()
                 if self.reflect and used_tools:
                     verdict = self._self_reflect()
@@ -3899,6 +4040,27 @@ class Agent:
             print(f"\n{self.tag}[!] 达到最大步数上限。")
             self._trace_event(f"达到步数上限 {loop_cap}", TraceLevel.WARNING)
         return final_text, used_tools
+    def _print_thinking(self, piece: str) -> None:
+        """把思考流打到「思考」通道，和正式回答在视觉上分开。"""
+        if self.quiet or not piece:
+            return
+        if not self._thinking_open:
+            header = f"{self.tag}✦ 思考" if self.tag else "✦ 思考"
+            print(f"\n{header}\n{self.tag}  ", end="", flush=True)
+            self._thinking_open = True
+        print(piece.replace("\n", f"\n{self.tag}  "), end="", flush=True)
+    def _end_thinking(self) -> None:
+        if self._thinking_open:
+            print(f"\n{self.tag}  ───────────────" if self.tag else "\n  ───────────────", flush=True)
+            self._thinking_open = False
+    def _record_reasoning(self, reasoning: str) -> None:
+        """留档最近一次真实推理：给 /trace、给上下文 provider 用。"""
+        text = (reasoning or "").strip()
+        if not text:
+            return
+        self.last_reasoning = text
+        THOUGHT_ENGINE.last_reasoning = text
+        self._trace_event("思考", TraceLevel.TRACE, detail=text[:160])
     def _call_llm(self) -> dict:
         openai_tools = self._all_openai_tools()
         params = {
@@ -3917,34 +4079,57 @@ class Agent:
             stream = self.backend.create_chat_completion(**params, stream=True)
             current_msg = {"role": "assistant", "content": ""}
             tool_calls_dict: dict[int, dict] = {}
+            splitter = ThinkingSplitter()
+            native_reasoning = ""
             for chunk in stream:
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta
+                # DeepSeek-R1 / QwQ / vLLM 这类端点会把模型原生的推理放在
+                # reasoning_content 里。有就直接用——那是模型真实的思考过程，
+                # 一分钱不用多花，也不需要靠提示词去要。
+                piece = getattr(delta, "reasoning_content", None)
+                if piece:
+                    native_reasoning += piece
+                    self._print_thinking(piece)
                 if getattr(delta, "content", None):
-                    print(delta.content, end="", flush=True)
+                    think_piece, answer_piece = splitter.feed(delta.content)
+                    if think_piece:
+                        self._print_thinking(think_piece)
+                    if answer_piece:
+                        print(answer_piece, end="", flush=True)
                     current_msg["content"] += delta.content
                 if getattr(delta, "tool_calls", None):
                     for tc in delta.tool_calls:
                         idx = tc.index
-                        if idx not in tool_calls_dict:
-                            tool_calls_dict[idx] = {
-                                "id": tc.id,
-                                "type": "function",
-                                "function": {"name": tc.function.name or "", "arguments": tc.function.arguments or ""},
-                            }
-                        else:
-                            if tc.function:
-                                if tc.function.name:
-                                    tool_calls_dict[idx]["function"]["name"] += tc.function.name
-                                if tc.function.arguments:
-                                    tool_calls_dict[idx]["function"]["arguments"] += tc.function.arguments
+                        # 不同的 OpenAI-Compatible 服务端分片方式差别很大：有的第一片
+                        # 只带 id/type 不带 function，有的 id 要到后面才补上。旧实现
+                        # 假设第一片一定带 function（直接 tc.function.name → 崩），
+                        # 且 id 只从第一片取（晚到就永远是 None → tool_call_id 为空被 API 拒）。
+                        slot = tool_calls_dict.setdefault(
+                            idx, {"id": None, "type": "function", "function": {"name": "", "arguments": ""}}
+                        )
+                        if getattr(tc, "id", None):
+                            slot["id"] = tc.id
+                        fn = getattr(tc, "function", None)
+                        if fn is not None:
+                            if getattr(fn, "name", None):
+                                slot["function"]["name"] += fn.name
+                            if getattr(fn, "arguments", None):
+                                slot["function"]["arguments"] += fn.arguments
             if tool_calls_dict:
                 current_msg["tool_calls"] = [v for _, v in sorted(tool_calls_dict.items())]
+            splitter.finish()
+            self._end_thinking()
             print()
+            # 存进 messages 的是原样输出（含 <thinking>），后续每一步都看得到它——
+            # 这正是「真 CoT」的关键：思考留在上下文里，才谈得上影响决策。
             self.messages.append(current_msg)
             self._trim_messages()
-            return current_msg
+            self._record_reasoning(native_reasoning or splitter.thinking)
+            visible = dict(current_msg)
+            visible["content"] = splitter.answer.strip() if splitter.thinking else current_msg["content"]
+            return visible
         res = self.backend.create_chat_completion(**params)
         msg = res.choices[0].message
         built_msg = {"role": "assistant", "content": msg.content or ""}
@@ -3957,11 +4142,21 @@ class Agent:
                 }
                 for tc in msg.tool_calls
             ]
-        if not self.quiet and msg.content:
-            print(msg.content)
+        thinking, answer = ThinkingSplitter.split(msg.content or "")
+        native = getattr(msg, "reasoning_content", "") or ""
+        if not self.quiet:
+            for line in (native or thinking).splitlines():
+                self._print_thinking(line + "\n")
+            self._end_thinking()
+            if answer:
+                print(answer)
         self.messages.append(built_msg)
         self._trim_messages()
-        return built_msg
+        self._record_reasoning(native or thinking)
+        visible = dict(built_msg)
+        if thinking:
+            visible["content"] = answer
+        return visible
     def _run_tools_and_feed_back(self, assistant_msg: dict) -> None:
         for tc in assistant_msg["tool_calls"]:
             name = tc["function"]["name"]
@@ -4431,6 +4626,108 @@ def run_self_tests() -> str:
         checks.append(("embedding_timeout", ok, f"超时 {backend.client.timeout}s"))
     except Exception as e:
         checks.append(("embedding_timeout", False, str(e)))
+    try:
+        # read_file 必须能读完整个文件。旧实现在 8000 字符处截断且没有翻页参数，
+        # 模型对 175 行之后的代码全盲，还不知道自己是盲的。
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "big.py")
+            _atomic_write_text(path, "\n".join(f"line_{i}" for i in range(1, 1001)))
+            head = read_file(path)
+            tail = read_file(path, offset=990, limit=20)
+            ok = (
+                "共 1000 行" in head
+                and "\t line_1" not in head and "1\tline_1" in head  # 带行号
+                and "offset=" in head                                # 明确告诉模型怎么读下一段
+                and "line_1000" in tail and "line_990" in tail       # 真的能读到结尾
+                and read_file(path, offset=5000).startswith("错误：")
+            )
+            checks.append(("read_file_paging", ok, f"首屏 {len(head.splitlines())} 行 / 可翻至末行"))
+    except Exception as e:
+        checks.append(("read_file_paging", False, str(e)))
+    try:
+        # run_shell 必须无条件交出退出码，否则 agent 分不清测试过没过。
+        ok_cmd = run_shell("echo hi")
+        bad_cmd = run_shell("python3 -c \"import sys; sys.exit(7)\"")
+        ok = (
+            ok_cmd.startswith("退出码 0") and "hi" in ok_cmd
+            and bad_cmd.startswith("退出码 7")
+            and not _looks_like_tool_failure(ok_cmd)
+            and _looks_like_tool_failure(bad_cmd)  # 失败要能被轨迹/心情/反思看见
+        )
+        checks.append(("shell_exit_code", ok, "成功/失败都带退出码且能被识别"))
+    except Exception as e:
+        checks.append(("shell_exit_code", False, str(e)))
+    try:
+        # 流式 tool_call 分片：不同 OpenAI-Compatible 服务端切法不同，
+        # 第一片可能不带 function，id 可能晚到——这两种以前都会出事。
+        def _delta(index, tid=None, name=None, args=None, with_fn=True):
+            fn = types.SimpleNamespace(name=name, arguments=args) if with_fn else None
+            return types.SimpleNamespace(index=index, id=tid, function=fn)
+        def _chunk(tool_calls):
+            return types.SimpleNamespace(
+                choices=[types.SimpleNamespace(delta=types.SimpleNamespace(content=None, tool_calls=tool_calls))])
+        class _StreamBackend(ChatBackend):
+            name = "selftest_stream"
+            def create_chat_completion(self, **kwargs):
+                return iter([
+                    _chunk([_delta(0, tid="call_a", with_fn=False)]),   # 只有 id
+                    _chunk([_delta(0, name="read_", args='{"pa')]),
+                    _chunk([_delta(0, name="file", args='th":"x.py"}')]),
+                    _chunk([_delta(1, name="calculator", args="{}")]),  # id 缺席
+                    _chunk([_delta(1, tid="call_b")]),                  # id 后补
+                ])
+        probe = Agent.__new__(Agent)
+        probe.backend, probe.model, probe.max_tokens = _StreamBackend(), "m", 16
+        # 流式分支的条件是 stream and not quiet，所以这里必须 quiet=False
+        probe.stream, probe.quiet, probe.tag = True, False, ""
+        probe.tools, probe.mcp_servers, probe._mcp_tool_map = {}, {}, {}
+        probe.messages, probe.max_context_messages = [], 40
+        probe.trace_enabled, probe._thinking_open, probe.last_reasoning = False, False, ""
+        probe._api_messages = lambda: []
+        calls = probe._call_llm().get("tool_calls") or []
+        ok = (
+            len(calls) == 2
+            and calls[0]["id"] == "call_a" and calls[0]["function"]["name"] == "read_file"
+            and calls[0]["function"]["arguments"] == '{"path":"x.py"}'
+            and calls[1]["id"] == "call_b"  # 晚到的 id 必须补得上
+        )
+        checks.append(("stream_tool_call_merge", ok, f"合并出 {len(calls)} 个调用，跨片名/参数/id 都对"))
+    except Exception as e:
+        checks.append(("stream_tool_call_merge", False, str(e)))
+    try:
+        # 真 CoT 的判定标准只有一条：思考留在上下文里、影响后续决策，
+        # 同时不混进给用户的答案。做不到这两点就还是内心戏。
+        think, answer = ThinkingSplitter.split("<thinking>先读再改</thinking>\n改好了。")
+        stream_sp = ThinkingSplitter()
+        for piece in ["<think", "ing>推理", "中</thin", "king>答案"]:
+            stream_sp.feed(piece)
+        stream_sp.finish()
+        class _CoTBackend(ChatBackend):
+            name = "selftest_cot"
+            def create_chat_completion(self, **kwargs):
+                msg = types.SimpleNamespace(
+                    content="<thinking>需要先确认边界情况</thinking>已修复。", tool_calls=None)
+                return types.SimpleNamespace(choices=[types.SimpleNamespace(message=msg)])
+        probe = Agent.__new__(Agent)
+        probe.backend, probe.model, probe.max_tokens = _CoTBackend(), "m", 16
+        probe.stream, probe.quiet, probe.tag = False, True, ""
+        probe.tools, probe.mcp_servers, probe._mcp_tool_map = {}, {}, {}
+        probe.messages, probe.max_context_messages = [], 40
+        probe.trace_enabled, probe._thinking_open, probe.last_reasoning = False, False, ""
+        probe._api_messages = lambda: []
+        visible = probe._call_llm()
+        stored = probe.messages[-1]["content"]
+        ok = (
+            think == "先读再改" and answer == "改好了。"
+            and stream_sp.thinking == "推理中" and stream_sp.answer == "答案"  # 标签被切两半也要对
+            and "<thinking>" in stored                    # 留在上下文里 → 有因果
+            and "<thinking>" not in visible["content"]    # 不混进答案
+            and visible["content"] == "已修复。"
+            and probe.last_reasoning == "需要先确认边界情况"
+        )
+        checks.append(("cot_is_causal", ok, "思考入历史、不入答案、跨分片可拆"))
+    except Exception as e:
+        checks.append(("cot_is_causal", False, str(e)))
     try:
         lines = []
         for name, passed, detail in checks:
