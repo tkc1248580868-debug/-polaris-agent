@@ -165,7 +165,7 @@ file edit.
 
 ### Self-tests
 
-`/selftest` runs a twenty-check suite covering JSON parsing, context building,
+`/selftest` runs a twenty-one-check suite covering JSON parsing, context building,
 snapshot round-trip, calculator sandbox escapes, shell guard rules, context
 starvation, step-budget direction, trace wiring, sub-agent isolation, tool
 description coverage, and three memory checks — curve direction and the spacing
@@ -261,6 +261,39 @@ offline flavour text, `llm` or `hybrid` for the pre-1.1.6 extra-call version.
 
 ---
 
+## Token cost
+
+The per-step overhead is dominated by one thing, and it is not the personality:
+
+| Component | Estimated tokens | Resent every step |
+|---|---:|---|
+| 35 tool schemas | ~3,560 | yes |
+| System prompt + CoT instruction | ~610 | yes |
+| Runtime context (10 providers) | ~180 | yes |
+
+**82% of it is the tool definitions.** Trimming the persona or the memory
+injection saves almost nothing; trimming the toolset saves most of the bill. It
+also improves tool selection — the model is not picking from 35 options when six
+are relevant.
+
+`/lean` switches profiles, `/cost` shows the current bill:
+
+| Profile | Tools | Tokens | vs `full` |
+|---|---:|---:|---:|
+| `full` (default) | 35 | ~3,560 | — |
+| `code` | 11 | ~1,420 | −60% |
+| `read` | 5 | ~630 | −82% |
+| `min` | 4 | ~620 | −83% |
+
+On a ten-step task, `/lean code` alone saves roughly 21,000 tokens. Profiles
+filter **built-in** tools only — plugin and MCP tools were added deliberately, so
+they are always exposed.
+
+The other lever is `/reflect`: with self-check on, every turn that used a tool
+spends one extra request carrying the entire history.
+
+---
+
 ## Quick start
 
 ```bash
@@ -349,6 +382,7 @@ Every file write is checkpointed first — `/undo` restores the previous version
 | `/undo` | Roll back the last file edit |
 | `/mode` · `/reset` · `/reflect` | Permission mode; clear session; toggle self-check |
 | `/tools` · `/plugins` · `/init` | Tool list; loaded plugins; generate `AGENT.md` |
+| `/lean [profile]` · `/cost` | Shrink the exposed toolset; show the per-step token bill |
 
 ---
 
@@ -367,6 +401,7 @@ Every file write is checkpointed first — `/undo` restores the previous version
 | `POLARIS_MONOLOGUE_MODEL` | (main model) | Separate model for the monologue. |
 | `POLARIS_MONOLOGUE_MAX_TOKENS` | `180` | Monologue length cap (legacy modes only). |
 | `POLARIS_COT_FEEDBACK` | `true` | Keep the model's reasoning in the message history so it informs later steps. Turning it off makes the chain of thought decorative again. |
+| `POLARIS_TOOL_PROFILE` | `full` | `full` · `code` · `min` · `read`. Which built-in tools are exposed to the model — the single biggest lever on token cost. |
 | `POLARIS_SHELL_ALLOW_DANGEROUS` | `false` | Lift the destructive-command block. |
 | `MINIAGENT_PLUGIN_DIRS` | `plugins` | Comma-separated plugin directories. |
 | `POLARIS_EMBED_BACKEND` | `auto` | `auto` · `remote` · `local`. `auto` uses the remote model when an endpoint is configured, else the local hash embedder. |

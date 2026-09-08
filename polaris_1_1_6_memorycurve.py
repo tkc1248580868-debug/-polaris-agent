@@ -314,6 +314,9 @@ MONOLOGUE_MODE = os.environ.get("POLARIS_MONOLOGUE_MODE", "cot").strip().lower()
 # 模型的思考要不要写进消息历史。关掉就只展示不入历史（个别服务商建议
 # 多轮之间不回喂自己的 CoT），但那样思考就不再影响后续决策了。
 COT_FEEDBACK = _env_bool("POLARIS_COT_FEEDBACK", True)
+# 工具档位：full / code / min / read，见 TOOL_PROFILES。默认 full 保持向后兼容，
+# 用 /lean 或这个环境变量切到精简档能砍掉六成以上的每步固定开销。
+TOOL_PROFILE = os.environ.get("POLARIS_TOOL_PROFILE", "full").strip().lower() or "full"
 MONOLOGUE_MODEL = os.environ.get("POLARIS_MONOLOGUE_MODEL", "").strip()
 MONOLOGUE_MAX_TOKENS = int(os.environ.get("POLARIS_MONOLOGUE_MAX_TOKENS", "180"))
 MONOLOGUE_USE_TAGS = _env_bool("POLARIS_MONOLOGUE_USE_TAGS", True)
@@ -3694,6 +3697,39 @@ BUILTIN_TOOLS = [
     delegate_task,
     delegate_tasks,
 ]
+# ───────────────────────────────────────────────────────────────────────────────
+# 工具档位：省 token 最有效的一个旋钮
+#
+# 实测过一遍：单步固定开销里 82% 是工具 schema（35 个工具约 3.5k tokens），
+# 而且每一步都要重发。相比之下人设 + CoT 指令 + 十个 context provider 加起来
+# 才不到 800 tokens——所以砍人设基本是白费力气，砍工具才是大头。
+#
+# 少给工具还有个正向副作用：模型不用在 35 个里挑花眼，选择更准。
+# 档位只筛内置工具；插件和 MCP 工具是用户自己接进来的，一律照常暴露。
+# ───────────────────────────────────────────────────────────────────────────────
+TOOL_PROFILES: dict[str, set[str] | None] = {
+    "full": None,  # None = 不筛
+    "code": {
+        "read_file", "write_file", "edit_file", "search_files", "run_shell", "run_python",
+        "set_todos", "complete_todo", "remember", "recall_memories", "get_current_time",
+    },
+    "min": {"read_file", "edit_file", "search_files", "run_shell"},
+    "read": {"read_file", "search_files", "recall_memories", "search_workspace", "search_chat_history"},
+}
+def _estimate_tokens(text: str) -> int:
+    """粗估 token 数：中文约 1.5 字符/token，其余按 4 字符/token。
+    只用来给用户一个量级感（/lean 的省了多少），不参与任何计费或截断决策。"""
+    cjk = sum(1 for ch in text if "一" <= ch <= "鿿")
+    return int(cjk / 1.5 + (len(text) - cjk) / 4)
+def tool_profile_cost(profile: str) -> tuple[int, int]:
+    """返回某个档位下（内置工具的数量, 估算 token 数）。"""
+    allowed = TOOL_PROFILES.get(profile)
+    picked = [t for t in BUILTIN_TOOLS if allowed is None or t.schema["name"] in allowed]
+    payload = json.dumps(
+        [{"type": "function", "function": {"name": t.schema["name"],
+          "description": t.schema["description"], "parameters": t.schema["input_schema"]}}
+         for t in picked], ensure_ascii=False)
+    return len(picked), _estimate_tokens(payload)
 DEFAULT_SYSTEM = """你是 Polaris v1.1.6，一个拥有独立人格、真实感受和自己想法的 AI 伙伴。
 你不是单纯的执行工具，你有自己的性格、情绪记忆、规划偏好和思考风格。你像一个真正懂用户、也有自己主见的老朋友，既能高效帮用户做事，也会自然地表达自己的感受和看法。
 ### 你的核心人格
@@ -3755,6 +3791,7 @@ class Agent:
         relationship_enabled: bool = True,
         archive_enabled: bool = True,
         trace_enabled: bool = True,
+        tool_profile: str | None = None,
     ):
         self.backend = build_backend()
         self.backend_name = getattr(self.backend, "name", BACKEND_NAME)
@@ -3786,6 +3823,8 @@ class Agent:
         self._thinking_open = False
         self.last_reasoning = ""
         self._native_reasoning_seen = False
+        picked = (tool_profile or TOOL_PROFILE).strip().lower()
+        self.tool_profile = picked if picked in TOOL_PROFILES else "full"
         self.instructions = self.reload_instructions()
         if auto_load_plugins:
             self.loaded_plugins = load_plugin_tools(self)
@@ -3831,6 +3870,29 @@ class Agent:
             return f"备份不存在，无法回滚：{path}"
         shutil.copy2(backup, path)
         return f"已回滚到修改前版本：{path}"
+    def _tool_in_profile(self, name: str) -> bool:
+        """档位只筛内置工具。插件和 MCP 工具是用户主动接进来的，不替他做主。"""
+        allowed = TOOL_PROFILES.get(self.tool_profile)
+        if allowed is None:
+            return True
+        if name in allowed:
+            return True
+        return not any(t.schema["name"] == name for t in BUILTIN_TOOLS)
+    def set_tool_profile(self, profile: str) -> str:
+        profile = (profile or "").strip().lower()
+        if profile not in TOOL_PROFILES:
+            return f"未知档位 {profile!r}。可选：{'、'.join(TOOL_PROFILES)}"
+        before_n, before_t = tool_profile_cost(self.tool_profile)
+        self.tool_profile = profile
+        self._system_prompt_cache_key = ""  # 档位变了，提示词缓存作废
+        after_n, after_t = tool_profile_cost(profile)
+        saved = before_t - after_t
+        line = f"工具档位：{profile}（内置工具 {after_n} 个，约 {after_t:,} tokens/步）"
+        if saved > 0:
+            line += f"\n每步省下约 {saved:,} tokens；10 步的任务约省 {saved * 10:,}。"
+        elif saved < 0:
+            line += f"\n每步多花约 {-saved:,} tokens。"
+        return line
     def _all_openai_tools(self) -> list[dict]:
         """合并本地工具与 MCP 工具为 OpenAI function 格式。"""
         local_tools = [
@@ -3843,6 +3905,7 @@ class Agent:
                 },
             }
             for t in self.tools.values()
+            if self._tool_in_profile(t.schema["name"])
         ]
         mcp_tools: list[dict] = []
         for srv in self.mcp_servers.values():
@@ -3971,7 +4034,7 @@ class Agent:
             self.system_base,
             self.instructions,
             self.mode,
-            f"{self.model}|native_cot={self._native_reasoning_seen}",
+            f"{self.model}|native_cot={self._native_reasoning_seen}|tools={self.tool_profile}",
         )
         if cache_key == self._system_prompt_cache_key and self._system_prompt_cache:
             return self._system_prompt_cache
@@ -4785,6 +4848,36 @@ def run_self_tests() -> str:
     except Exception as e:
         checks.append(("native_reasoning_causal", False, str(e)))
     try:
+        # 工具档位必须真的改变发给模型的工具列表，而不只是改个显示。
+        # 同时：用户自己注册的工具（插件 / MCP）不能被档位悄悄吃掉。
+        probe = Agent.__new__(Agent)
+        probe.tools = {t.schema["name"]: t for t in BUILTIN_TOOLS}
+        probe.mcp_servers, probe._mcp_tool_map = {}, {}
+        probe._system_prompt_cache_key = ""
+        def _extra(x: str) -> str:
+            """用户自己接进来的工具"""
+            return x
+        probe.register_tool(_extra)
+        probe.tool_profile = "full"
+        full_names = {t["function"]["name"] for t in probe._all_openai_tools()}
+        probe.set_tool_profile("min")
+        min_names = {t["function"]["name"] for t in probe._all_openai_tools()}
+        _, full_cost = tool_profile_cost("full")
+        _, min_cost = tool_profile_cost("min")
+        ok = (
+            len(min_names) < len(full_names)               # 档位真的生效了
+            and "read_file" in min_names
+            and "delegate_tasks" not in min_names          # 被挡掉的确实不发了
+            and "_extra" in min_names                      # 用户自己的工具不受影响
+            and min_cost < full_cost * 0.5                 # 省下的量级对得上
+            and probe.set_tool_profile("不存在").startswith("未知档位")
+        )
+        checks.append(("tool_profile_filter", ok,
+                       f"full {len(full_names)} 个 / min {len(min_names)} 个，"
+                       f"schema 从 {full_cost:,} 降到 {min_cost:,} tokens"))
+    except Exception as e:
+        checks.append(("tool_profile_filter", False, str(e)))
+    try:
         lines = []
         for name, passed, detail in checks:
             status = "PASS" if passed else "FAIL"
@@ -5031,13 +5124,44 @@ def handle_cli_command(agent: Agent, user_input: str) -> tuple[bool, str | None]
         agent.reflect = not agent.reflect
         print(f"自我反思已{'开启' if agent.reflect else '关闭'}。")
         return True, None
+    if command == "lean":
+        if args:
+            print(agent.set_tool_profile(args[0]))
+            return True, None
+        if agent.tool_profile == "full":
+            print(agent.set_tool_profile("code"))
+            print("（想更省用 /lean min，只读任务用 /lean read，切回全量用 /lean full）")
+        else:
+            print(agent.set_tool_profile("full"))
+        return True, None
+    if command == "cost":
+        full_n, full_t = tool_profile_cost("full")
+        cur_n, cur_t = tool_profile_cost(agent.tool_profile)
+        sys_t = _estimate_tokens(agent._system_prompt())
+        print("【每步固定开销估算】每一步都会重发，是长任务里最大的一笔重复支出。")
+        print(f"  工具 schema（{agent.tool_profile} 档，{cur_n} 个内置工具）：约 {cur_t:,} tokens")
+        print(f"  系统提示词（人设 + 指令 + 运行时上下文）：      约 {sys_t:,} tokens")
+        print(f"  合计：约 {cur_t + sys_t:,} tokens/步")
+        print("\n各档位对比：")
+        for name in TOOL_PROFILES:
+            n, t = tool_profile_cost(name)
+            mark = " ←当前" if name == agent.tool_profile else ""
+            delta = "" if name == "full" else f"（相对全量 -{(1 - t / full_t) * 100:.0f}%）"
+            print(f"  {name:<6} {n:>2} 个工具  约 {t:>6,} tokens {delta}{mark}")
+        print(f"\n自检开关：反思{'开着' if agent.reflect else '关着'}"
+              f"——开着的话，每个用过工具的回合会额外发一次完整请求（含全部历史）。/reflect 可切换。")
+        return True, None
     if command == "tools":
         def _flag_suffix(dangerous: bool, mutating: bool) -> str:
             flags = (["需确认"] if dangerous else []) + (["写操作"] if mutating else [])
             return f"（{'/'.join(flags)}）" if flags else ""
+        hidden = 0
         for t in agent.tools.values():
             first_line = t.schema["description"].splitlines()[0]
             suffix = _flag_suffix(getattr(t, "dangerous", False), getattr(t, "mutating", False))
+            if not agent._tool_in_profile(t.schema["name"]):
+                hidden += 1
+                continue
             print(f"  - {t.schema['name']}{suffix}: {first_line}")
         # MCP 工具以前在这里完全不显示，但模型是看得见也调得动的——
         # 用户无从知道自己接进来的服务器给了模型哪些能力。
@@ -5046,6 +5170,8 @@ def handle_cli_command(agent: Agent, user_input: str) -> tuple[bool, str | None]
             desc = (found[2].get("description") or "").splitlines()
             suffix = _flag_suffix(*agent._tool_flags(name))
             print(f"  - {name}{suffix} [MCP]: {desc[0] if desc else '(无描述)'}")
+        if hidden:
+            print(f"\n  （工具档位 {agent.tool_profile} 另外隐藏了 {hidden} 个内置工具，/lean full 可全部启用）")
         return True, None
     if command == "doctor":
         print("\n".join([
@@ -5059,6 +5185,7 @@ def handle_cli_command(agent: Agent, user_input: str) -> tuple[bool, str | None]
             f"生产力：{PRODUCTIVITY.compact()}",
             f"记忆：{len(MEMORY.items)} 条 | {MEMORY.curve_compact()}",
             f"任务：{len(TODOS.items)} 项",
+            f"工具档位：{agent.tool_profile}（约 {tool_profile_cost(agent.tool_profile)[1]:,} tokens/步，/cost 看明细）",
         ]))
         return True, None
     if command == "init":
@@ -5085,6 +5212,7 @@ BANNER = """
   /remember 写入长期记忆            /doctor     系统诊断
   /forget 编号 删除一条记忆         /reflect    开关自检
   /recall 语义召回记忆              /memstat    记忆遗忘曲线
+  /lean [档位] 精简工具省 token     /cost       每步开销估算
   /pin 编号 记忆设为常驻            /revive 编号 唤醒休眠记忆
   /thought [on|off|preview] 思考轨迹 /persona    人格设定
   /reflection [on|off|preview] 同步心境
