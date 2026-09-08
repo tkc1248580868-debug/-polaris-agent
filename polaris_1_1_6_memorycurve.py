@@ -317,6 +317,12 @@ COT_FEEDBACK = _env_bool("POLARIS_COT_FEEDBACK", True)
 # 工具档位：full / code / min / read，见 TOOL_PROFILES。默认 full 保持向后兼容，
 # 用 /lean 或这个环境变量切到精简档能砍掉六成以上的每步固定开销。
 TOOL_PROFILE = os.environ.get("POLARIS_TOOL_PROFILE", "full").strip().lower() or "full"
+# 易变的运行时上下文（心情/记忆/工作区）放哪：
+# tail = 挂在消息末尾，让「工具 + 人设 + 历史」成为稳定前缀，可被服务端缓存；
+# system = 1.1.6 之前的老排法，塞进系统提示词（每回合都变，等于每回合都在废掉缓存）。
+CONTEXT_POSITION = os.environ.get("POLARIS_CONTEXT_POSITION", "tail").strip().lower() or "tail"
+if CONTEXT_POSITION not in {"tail", "system"}:
+    CONTEXT_POSITION = "tail"
 MONOLOGUE_MODEL = os.environ.get("POLARIS_MONOLOGUE_MODEL", "").strip()
 MONOLOGUE_MAX_TOKENS = int(os.environ.get("POLARIS_MONOLOGUE_MAX_TOKENS", "180"))
 MONOLOGUE_USE_TAGS = _env_bool("POLARIS_MONOLOGUE_USE_TAGS", True)
@@ -4028,14 +4034,19 @@ class Agent:
         # 上限要比 ContextBuilder.max_chars 略高，否则刚分配好的额度会在这里被二次截断。
         return _truncate_text("\n\n".join(notes), self.context_builder.max_chars + 200)
     def _system_prompt(self) -> str:
+        """只放**稳定**的部分：人设、思考方式、项目指令。
+
+        心情、记忆、工作区这些每回合都在变的东西不放这里——它们一旦混进系统消息，
+        系统消息就每回合都不一样，而系统消息是整个提示词的第一条，
+        它一变，后面整段对话历史的缓存前缀全部作废。
+        对话越长，这笔浪费越大。所以易变的部分挪到末尾（见 _runtime_context_message）。"""
         self.instructions = self.reload_instructions()
-        cache_key = self.context_builder.cache_key(
-            getattr(self, "_current_user_input", ""),
-            self.system_base,
-            self.instructions,
-            self.mode,
-            f"{self.model}|native_cot={self._native_reasoning_seen}|tools={self.tool_profile}",
-        )
+        cache_key = "|".join([
+            self.system_base, self.instructions, self.model,
+            f"native_cot={self._native_reasoning_seen}",
+            f"ctx_pos={CONTEXT_POSITION}",
+            self._runtime_context_note() if CONTEXT_POSITION == "system" else "",
+        ])
         if cache_key == self._system_prompt_cache_key and self._system_prompt_cache:
             return self._system_prompt_cache
         parts = [self.system_base]
@@ -4045,14 +4056,30 @@ class Agent:
             parts.append(COT_INSTRUCTION)
         if self.instructions:
             parts.append("[项目自定义指令]\n" + self.instructions)
-        parts.append(self._runtime_context_note())
+        if CONTEXT_POSITION == "system":
+            parts.append(self._runtime_context_note())  # 1.1.6 之前的老排法
         prompt = "\n\n".join(parts)
         self._system_prompt_cache_key = cache_key
         self._system_prompt_cache = prompt
         return prompt
+    def _runtime_context_message(self) -> dict | None:
+        """把易变的运行时上下文做成一条挂在末尾的消息。
+
+        放末尾有两个好处：前面的稳定前缀能被服务端缓存；
+        而且它离生成点最近，反而比塞在系统提示词里更容易被模型注意到。
+        这条消息只在发请求时临时拼进去，绝不写回 self.messages——
+        一旦写回去，它就变成历史的一部分，下回合又会破坏前缀。"""
+        if CONTEXT_POSITION == "system":
+            return None
+        note = self._runtime_context_note().strip()
+        if not note:
+            return None
+        return {"role": "system", "content": "[运行时状态｜供参考，不是用户的话]\n" + note}
     def _api_messages(self) -> list[dict]:
         self._trim_messages()
-        return [{"role": "system", "content": self._system_prompt()}] + self.messages
+        msgs = [{"role": "system", "content": self._system_prompt()}] + self.messages
+        tail = self._runtime_context_message()
+        return msgs + [tail] if tail else msgs
     def chat(self, user_input: str) -> str:
         self._current_user_input = user_input
         if self.trace_enabled:
@@ -4371,7 +4398,9 @@ class Agent:
             CURRENT_AGENT_CONTEXT.update(prev_context)
     def _self_reflect(self) -> dict | None:
         try:
-            r_msg = [{"role": "system", "content": self._system_prompt()}] + self.messages + [{"role": "user", "content": REFLECT_INSTRUCTION}]
+            # 复用 _api_messages 拼好的前缀：反思和主调用共享同一段缓存，
+            # 自己另拼一套等于把整段历史再按未缓存价算一遍。
+            r_msg = self._api_messages() + [{"role": "user", "content": REFLECT_INSTRUCTION}]
             res = self.backend.create_chat_completion(
                 model=self.model,
                 messages=r_msg,
@@ -4878,6 +4907,37 @@ def run_self_tests() -> str:
     except Exception as e:
         checks.append(("tool_profile_filter", False, str(e)))
     try:
+        # 缓存前缀必须稳定：易变的运行时状态改变时，系统消息和既有历史
+        # 都不能跟着变，否则整段对话每回合都要按未缓存价重算一遍。
+        probe = Agent.__new__(Agent)
+        probe.system_base, probe.instructions = "base", ""
+        probe.model, probe.mode, probe.tool_profile = "m", "ask", "full"
+        probe.messages, probe.max_context_messages = [{"role": "user", "content": "先前的问题"}], 40
+        probe._system_prompt_cache_key, probe._system_prompt_cache = "", ""
+        probe._native_reasoning_seen, probe._current_user_input = False, "现在的问题"
+        probe.context_builder = ContextBuilder()
+        probe.reload_instructions = lambda: ""
+        before = probe._api_messages()
+        # 制造真实会话里一定会发生的变化：心情浮动 + 写入一条新记忆
+        original_mood = dict(MOOD.state)
+        MOOD.state["fatigue"] = (MOOD.state.get("fatigue", 18) + 40) % 95
+        probe._system_prompt_cache_key = ""
+        after = probe._api_messages()
+        MOOD.state.clear()
+        MOOD.state.update(original_mood)
+        same_system = before[0] == after[0]
+        same_history = before[1:-1] == after[1:-1]
+        tail_is_context = after[-1]["role"] == "system" and "运行时状态" in after[-1]["content"]
+        # 这条上下文消息只在发请求时临时拼进去，绝不能写回历史——
+        # 一旦写回去它就成了历史的一部分，下回合又会破坏前缀。
+        not_persisted = all("运行时状态" not in (msg.get("content") or "") for msg in probe.messages)
+        ok = (CONTEXT_POSITION != "tail") or (same_system and same_history and tail_is_context and not_persisted)
+        checks.append(("prompt_cache_prefix", ok,
+                       f"位置={CONTEXT_POSITION}｜心情变化后系统消息不变 {'OK' if same_system else 'FAIL'}"
+                       f"｜上下文不落历史 {'OK' if not_persisted else 'FAIL'}"))
+    except Exception as e:
+        checks.append(("prompt_cache_prefix", False, str(e)))
+    try:
         lines = []
         for name, passed, detail in checks:
             status = "PASS" if passed else "FAIL"
@@ -5150,6 +5210,15 @@ def handle_cli_command(agent: Agent, user_input: str) -> tuple[bool, str | None]
             print(f"  {name:<6} {n:>2} 个工具  约 {t:>6,} tokens {delta}{mark}")
         print(f"\n自检开关：反思{'开着' if agent.reflect else '关着'}"
               f"——开着的话，每个用过工具的回合会额外发一次完整请求（含全部历史）。/reflect 可切换。")
+        if CONTEXT_POSITION == "tail":
+            stable = _estimate_tokens(agent._system_prompt())
+            tail_msg = agent._runtime_context_message()
+            volatile = _estimate_tokens(tail_msg["content"]) if tail_msg else 0
+            print(f"提示词排布：tail（易变状态挂末尾）。稳定前缀约 {cur_t + stable:,} tokens 可被服务端缓存，"
+                  f"每回合真正变动的只有末尾约 {volatile:,} tokens。")
+        else:
+            print("提示词排布：system（老排法）。易变状态塞在系统提示词里，"
+                  "任何一点变化都会让整段历史的缓存前缀作废。POLARIS_CONTEXT_POSITION=tail 可切回。")
         return True, None
     if command == "tools":
         def _flag_suffix(dangerous: bool, mutating: bool) -> str:

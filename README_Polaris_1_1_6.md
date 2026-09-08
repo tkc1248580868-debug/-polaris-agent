@@ -165,7 +165,7 @@ file edit.
 
 ### Self-tests
 
-`/selftest` runs a twenty-one-check suite covering JSON parsing, context building,
+`/selftest` runs a twenty-two-check suite covering JSON parsing, context building,
 snapshot round-trip, calculator sandbox escapes, shell guard rules, context
 starvation, step-budget direction, trace wiring, sub-agent isolation, tool
 description coverage, and three memory checks — curve direction and the spacing
@@ -292,6 +292,34 @@ they are always exposed.
 The other lever is `/reflect`: with self-check on, every turn that used a tool
 spends one extra request carrying the entire history.
 
+### Keeping the cache prefix stable
+
+Providers discount tokens they have already seen, as long as the *prefix* of the
+prompt is unchanged. Polaris used to put mood, memory, workspace state and the
+todo list inside the system message — the very first thing in the prompt. Any one
+of those changing invalidated everything after it, which is the entire
+conversation.
+
+Volatile state now goes in a message at the **end** of the request instead, so
+tools, persona and the whole transcript form a prefix that only ever grows. It is
+assembled per request and never written back into the history — persisting it
+would make it part of the transcript and break the prefix all over again.
+
+Measured over a ten-turn session, comparing the shareable prefix between
+consecutive requests:
+
+| | old layout | `tail` (default) |
+|---|---:|---:|
+| Nothing in the context changes | 92% | 72% |
+| A real coding session — todos updated, lessons written, mood drifting | **0%** | **70%** |
+
+It is a genuine trade-off, not a free win: with a completely static context the
+old layout cached more, because the volatile block sat inside the already-cached
+system message. But the moment anything changed it fell to zero, and during real
+work something changes every turn. The `tail` layout gives up the best case to
+never hit the worst one. `POLARIS_CONTEXT_POSITION=system` restores the old
+behaviour.
+
 ---
 
 ## Quick start
@@ -402,6 +430,7 @@ Every file write is checkpointed first — `/undo` restores the previous version
 | `POLARIS_MONOLOGUE_MAX_TOKENS` | `180` | Monologue length cap (legacy modes only). |
 | `POLARIS_COT_FEEDBACK` | `true` | Keep the model's reasoning in the message history so it informs later steps. Turning it off makes the chain of thought decorative again. |
 | `POLARIS_TOOL_PROFILE` | `full` | `full` · `code` · `min` · `read`. Which built-in tools are exposed to the model — the single biggest lever on token cost. |
+| `POLARIS_CONTEXT_POSITION` | `tail` | Where volatile runtime state goes. `tail` keeps the cache prefix stable; `system` is the pre-1.1.6 layout. |
 | `POLARIS_SHELL_ALLOW_DANGEROUS` | `false` | Lift the destructive-command block. |
 | `MINIAGENT_PLUGIN_DIRS` | `plugins` | Comma-separated plugin directories. |
 | `POLARIS_EMBED_BACKEND` | `auto` | `auto` · `remote` · `local`. `auto` uses the remote model when an endpoint is configured, else the local hash embedder. |
