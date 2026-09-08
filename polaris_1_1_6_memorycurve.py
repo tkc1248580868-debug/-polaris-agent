@@ -320,6 +320,9 @@ TOOL_PROFILE = os.environ.get("POLARIS_TOOL_PROFILE", "full").strip().lower() or
 # 易变的运行时上下文（心情/记忆/工作区）放哪：
 # tail = 挂在消息末尾，让「工具 + 人设 + 历史」成为稳定前缀，可被服务端缓存；
 # system = 1.1.6 之前的老排法，塞进系统提示词（每回合都变，等于每回合都在废掉缓存）。
+# 对话历史的 token 预算。只按消息条数裁剪挡不住大文件：一条 read_file 结果
+# 可达两万多字符，40 条就是约 24 万 tokens，早就撑爆窗口了。
+MAX_CONTEXT_TOKENS = max(1000, int(os.environ.get("POLARIS_MAX_CONTEXT_TOKENS", "32000")))
 CONTEXT_POSITION = os.environ.get("POLARIS_CONTEXT_POSITION", "tail").strip().lower() or "tail"
 if CONTEXT_POSITION not in {"tail", "system"}:
     CONTEXT_POSITION = "tail"
@@ -3791,6 +3794,7 @@ class Agent:
         quiet: bool = False,
         tag: str = "",
         max_context_messages: int = 40,
+        max_context_tokens: int = MAX_CONTEXT_TOKENS,
         auto_load_plugins: bool = True,
         mcp_servers: list[MCPServerStdio] | None = None,
         show_thought: bool | None = None,
@@ -3818,6 +3822,7 @@ class Agent:
         self.trace_enabled = trace_enabled
         self.tag = tag
         self.max_context_messages = max_context_messages
+        self.max_context_tokens = max_context_tokens
         self.messages: list[dict] = []
         self.tools: dict[str, Callable] = {t.schema["name"]: t for t in (tools or [])}
         self.checkpoints: list[tuple[str, str | None]] = []
@@ -3930,10 +3935,29 @@ class Agent:
                 with open(path, encoding="utf-8", errors="replace") as f:
                     parts.append(f"[来自 {path} 的指令]\n{_truncate_text(f.read().strip(), 1200)}")
         return "\n\n".join(parts)
+    def _keep_window(self) -> list[dict]:
+        """按「条数」和「token 预算」两个上限取较紧的那个。
+
+        只按条数裁是不够的：一条 read_file 的结果可以有两万多字符，
+        40 条这样的消息约 24 万 tokens，早就把窗口撑爆了（直接 400）。
+        这里从最新的一条往回收，收满预算为止；无论如何至少保留最后一条，
+        否则一条超长消息会把整个历史清空。"""
+        window = self.messages[-self.max_context_messages:]
+        budget = max(1000, self.max_context_tokens)
+        kept: list[dict] = []
+        used = 0
+        for msg in reversed(window):
+            cost = _estimate_tokens(json.dumps(msg, ensure_ascii=False))
+            if kept and used + cost > budget:
+                break
+            kept.append(msg)
+            used += cost
+        kept.reverse()
+        return kept
     def _trim_messages(self) -> None:
-        if len(self.messages) <= self.max_context_messages:
+        trimmed = self._keep_window()
+        if len(trimmed) == len(self.messages):
             return
-        trimmed = list(self.messages[-self.max_context_messages:])
         while trimmed and trimmed[0].get("role") == "tool":
             trimmed.pop(0)
         while trimmed:
@@ -4799,7 +4823,7 @@ def run_self_tests() -> str:
         # 流式分支的条件是 stream and not quiet，所以这里必须 quiet=False
         probe.stream, probe.quiet, probe.tag = True, False, ""
         probe.tools, probe.mcp_servers, probe._mcp_tool_map = {}, {}, {}
-        probe.messages, probe.max_context_messages = [], 40
+        probe.messages, probe.max_context_messages, probe.max_context_tokens = [], 40, MAX_CONTEXT_TOKENS
         probe.trace_enabled, probe._thinking_open, probe.last_reasoning = False, False, ""
         probe._api_messages = lambda: []
         calls = probe._call_llm().get("tool_calls") or []
@@ -4830,7 +4854,7 @@ def run_self_tests() -> str:
         probe.backend, probe.model, probe.max_tokens = _CoTBackend(), "m", 16
         probe.stream, probe.quiet, probe.tag = False, True, ""
         probe.tools, probe.mcp_servers, probe._mcp_tool_map = {}, {}, {}
-        probe.messages, probe.max_context_messages = [], 40
+        probe.messages, probe.max_context_messages, probe.max_context_tokens = [], 40, MAX_CONTEXT_TOKENS
         probe.trace_enabled, probe._thinking_open, probe.last_reasoning = False, False, ""
         probe._api_messages = lambda: []
         visible = probe._call_llm()
@@ -4859,7 +4883,7 @@ def run_self_tests() -> str:
         probe.backend, probe.model, probe.max_tokens = _NativeBackend(), "m", 16
         probe.stream, probe.quiet, probe.tag = False, True, ""
         probe.tools, probe.mcp_servers, probe._mcp_tool_map = {}, {}, {}
-        probe.messages, probe.max_context_messages = [], 40
+        probe.messages, probe.max_context_messages, probe.max_context_tokens = [], 40, MAX_CONTEXT_TOKENS
         probe.trace_enabled, probe._thinking_open = False, False
         probe.last_reasoning, probe._native_reasoning_seen = "", False
         probe._api_messages = lambda: []
@@ -4913,6 +4937,7 @@ def run_self_tests() -> str:
         probe.system_base, probe.instructions = "base", ""
         probe.model, probe.mode, probe.tool_profile = "m", "ask", "full"
         probe.messages, probe.max_context_messages = [{"role": "user", "content": "先前的问题"}], 40
+        probe.max_context_tokens = MAX_CONTEXT_TOKENS
         probe._system_prompt_cache_key, probe._system_prompt_cache = "", ""
         probe._native_reasoning_seen, probe._current_user_input = False, "现在的问题"
         probe.context_builder = ContextBuilder()
@@ -4937,6 +4962,48 @@ def run_self_tests() -> str:
                        f"｜上下文不落历史 {'OK' if not_persisted else 'FAIL'}"))
     except Exception as e:
         checks.append(("prompt_cache_prefix", False, str(e)))
+    try:
+        # 裁剪必须按 token 预算，不能只数消息条数。
+        # read_file 单条能返回两万多字符，40 条这样的消息约 24 万 tokens，
+        # 只按条数裁的话直接把窗口撑爆（400）。
+        probe = Agent.__new__(Agent)
+        probe.max_context_messages, probe.max_context_tokens = 40, 20000
+        probe.messages = []
+        for i in range(20):
+            probe.messages.append({"role": "user", "content": f"读第 {i} 个文件"})
+            probe.messages.append({"role": "user", "content": "x" * 24000})
+        probe._trim_messages()
+        within = _estimate_tokens(json.dumps(probe.messages, ensure_ascii=False)) <= 20000
+        # tool_calls 和它的结果不能被裁散，开头也不能是孤立的 tool 消息
+        probe2 = Agent.__new__(Agent)
+        probe2.max_context_messages, probe2.max_context_tokens = 40, 1200
+        probe2.messages = []
+        for i in range(12):
+            probe2.messages.append({"role": "assistant", "content": "", "tool_calls": [
+                {"id": f"c{i}", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]})
+            probe2.messages.append({"role": "tool", "tool_call_id": f"c{i}", "name": "read_file",
+                                    "content": "内容" * 200})
+        probe2._trim_messages()
+        orphans = 0
+        for idx, msg in enumerate(probe2.messages):
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                need, got, j = len(msg["tool_calls"]), 0, idx + 1
+                while j < len(probe2.messages) and probe2.messages[j].get("role") == "tool":
+                    got += 1
+                    j += 1
+                if got < need:
+                    orphans += 1
+        head_ok = not probe2.messages or probe2.messages[0].get("role") != "tool"
+        # 单条就超预算时也不能把历史清空，否则模型连用户问了什么都看不到
+        probe3 = Agent.__new__(Agent)
+        probe3.max_context_messages, probe3.max_context_tokens = 40, 1000
+        probe3.messages = [{"role": "user", "content": "x" * 100000}]
+        probe3._trim_messages()
+        ok = within and orphans == 0 and head_ok and len(probe3.messages) == 1
+        checks.append(("context_token_budget", ok,
+                       f"预算内 {'OK' if within else 'FAIL'}｜孤儿 tool_calls {orphans} 个｜超长单条不清空"))
+    except Exception as e:
+        checks.append(("context_token_budget", False, str(e)))
     try:
         lines = []
         for name, passed, detail in checks:

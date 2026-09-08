@@ -165,7 +165,7 @@ file edit.
 
 ### Self-tests
 
-`/selftest` runs a twenty-two-check suite covering JSON parsing, context building,
+`/selftest` runs a twenty-three-check suite covering JSON parsing, context building,
 snapshot round-trip, calculator sandbox escapes, shell guard rules, context
 starvation, step-budget direction, trace wiring, sub-agent isolation, tool
 description coverage, and three memory checks — curve direction and the spacing
@@ -201,6 +201,12 @@ means a more careful strategy, not a smaller budget.
   a determined attacker — real isolation means running Polaris in a container or
   under a dedicated low-privilege account.
 - **Sub-agents** no longer write into the main conversation archive or trace tree.
+- **History is trimmed by token budget, not just message count.** Counting
+  messages was survivable while every tool result was capped at 8,000 characters.
+  Once `read_file` could return 24,000, forty such messages came to roughly
+  240,000 tokens — past the window of most models, and a hard API error rather
+  than a graceful degradation. Both caps now apply, whichever binds first, and the
+  tool-call/result pairing repair still runs afterwards.
 - **`read_file` can read a whole file.** It used to cut off at 8,000 characters
   with no way to continue — the agent went blind after ~175 lines and had no way
   to know it. It now takes `offset` / `limit`, returns numbered lines that line up
@@ -431,6 +437,7 @@ Every file write is checkpointed first — `/undo` restores the previous version
 | `POLARIS_COT_FEEDBACK` | `true` | Keep the model's reasoning in the message history so it informs later steps. Turning it off makes the chain of thought decorative again. |
 | `POLARIS_TOOL_PROFILE` | `full` | `full` · `code` · `min` · `read`. Which built-in tools are exposed to the model — the single biggest lever on token cost. |
 | `POLARIS_CONTEXT_POSITION` | `tail` | Where volatile runtime state goes. `tail` keeps the cache prefix stable; `system` is the pre-1.1.6 layout. |
+| `POLARIS_MAX_CONTEXT_TOKENS` | `32000` | Token budget for the conversation history. Lower it for small local models. |
 | `POLARIS_SHELL_ALLOW_DANGEROUS` | `false` | Lift the destructive-command block. |
 | `MINIAGENT_PLUGIN_DIRS` | `plugins` | Comma-separated plugin directories. |
 | `POLARIS_EMBED_BACKEND` | `auto` | `auto` · `remote` · `local`. `auto` uses the remote model when an endpoint is configured, else the local hash embedder. |
