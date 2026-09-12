@@ -3994,18 +3994,42 @@ class Agent:
                 with open(path, encoding="utf-8", errors="replace") as f:
                     parts.append(f"[来自 {path} 的指令]\n{_truncate_text(f.read().strip(), 1200)}")
         return "\n\n".join(parts)
-    def _task_anchor(self) -> dict | None:
-        """第一条用户消息——也就是「这次到底要干什么」。
+    def _pinned_messages(self, budget: int) -> list[dict]:
+        """用户说过的话优先保住，工具结果才是该让位的那个。
 
-        按时间裁剪时它最老，所以第一个被删；而它恰恰是最不该删的那条。
-        实测过：61 条消息裁到 28 条之后，「把登录模块重构成 JWT，
-        别动数据库」没了，二十几条「好的，第 16 步」留着。
-        于是 Agent 还在干活，却已经不知道自己在干嘛了。
-        这不是取舍，是 bug。"""
-        for msg in self.messages:
-            if msg.get("role") == "user":
-                return msg
-        return None
+        按时间裁剪意味着最老的先死，但在编程会话里，用户消息又短又关键——
+        任务、约束、中途的纠正——而占地方的全是工具结果。实测一个 34 条的
+        编程会话：所有用户消息加起来 22 tokens，占总量 0.3%。
+
+        只钉第一条是不够的。真实场景里你会中途改主意（「等一下，改用 RS256」），
+        那句比最初的任务更贴近当下，丢了它 Agent 会自信地按旧方案继续做，
+        比全忘了还糟。
+
+        总量超过预算一半时优先留最新的几条，但第一条（任务描述）始终保留——
+        它带着那些只说过一次、之后再没重复过的约束。"""
+        users = [msg for msg in self.messages if msg.get("role") == "user"]
+        if not users:
+            return []
+        def cost_of(msg: dict) -> int:
+            return _estimate_tokens(json.dumps(msg, ensure_ascii=False))
+        # 上限是硬的。先给第一条（任务描述）预留，再用剩下的额度从新往旧装。
+        # 早先那版是「装完再无条件把第一条插回去」，结果用户粘两段大日志就
+        # 直接冲破预算——钉住用户消息不能反过来变成撑爆上下文的新途径。
+        cap = max(1, budget // 2)
+        chosen: list[dict] = []
+        used = 0
+        if cost_of(users[0]) <= cap:
+            chosen.append(users[0])
+            used = cost_of(users[0])
+        for msg in reversed(users[1:]):
+            cost = cost_of(msg)
+            if used + cost > cap:
+                break
+            chosen.append(msg)
+            used += cost
+        order = {id(msg): idx for idx, msg in enumerate(self.messages)}
+        chosen.sort(key=lambda msg: order.get(id(msg), 0))
+        return chosen
     def _keep_window(self) -> list[dict]:
         """按「条数」和「token 预算」两个上限取较紧的那个。
 
@@ -4027,15 +4051,20 @@ class Agent:
             return kept
         budget = max(1000, self.max_context_tokens)
         kept = collect(budget)
-        # 任务描述单独留一个位置。注意这不会多删任何东西——该删几条还是几条，
-        # 只是保证被删的那些里面不包含「要干什么」。
+        # 给用户消息单独留位置。注意这不会多删任何东西——该删几条还是几条，
+        # 只是把被删的名额优先让给工具结果。
         # 判断依据必须是「它有没有活下来」：条数没超但 token 预算超了的时候，
         # 它照样会在上面那一关被刷掉。
-        anchor = self._task_anchor()
-        if anchor is not None and not any(msg is anchor for msg in kept):
-            reserve = _estimate_tokens(json.dumps(anchor, ensure_ascii=False))
+        pinned = self._pinned_messages(budget)
+        missing = [msg for msg in pinned if not any(k is msg for k in kept)]
+        if missing:
+            reserve = sum(_estimate_tokens(json.dumps(msg, ensure_ascii=False)) for msg in missing)
             kept = collect(max(1, budget - reserve))
-            kept.insert(0, anchor)
+            missing = [msg for msg in pinned if not any(k is msg for k in kept)]
+            # 插回去要保持原始先后顺序，不能按别的顺序拼——
+            # 对话是有前后文的，顺序错了模型读出来就是另一个意思。
+            order = {id(msg): idx for idx, msg in enumerate(self.messages)}
+            kept = sorted(kept + missing, key=lambda msg: order.get(id(msg), len(order)))
         return kept
     def _trim_messages(self) -> None:
         trimmed = self._keep_window()
@@ -5116,6 +5145,25 @@ def run_self_tests() -> str:
                                    "content": "内容" * 150})
         def _has_task(p) -> bool:
             return any("JWT" in (msg.get("content") or "") for msg in p.messages)
+        # 用户中途改主意那句，比最初的任务更贴近当下，丢了比全忘更糟——
+        # Agent 会自信地按旧方案继续做。
+        def _chat_with_correction(p):
+            for i in range(8):
+                p.messages.append({"role": "user", "content": "继续。" + "闲聊内容。" * 40})
+            p.messages.append({"role": "user", "content": "等一下，改用 RS256"})
+            for i in range(8):
+                p.messages.append({"role": "user", "content": "继续。" + "闲聊内容。" * 40})
+        correction_probe = _probe_with(3000, _chat_with_correction)
+        keeps_correction = any("RS256" in (msg.get("content") or "") for msg in correction_probe.messages)
+        # 钉住用户消息不能反过来变成撑爆上下文的途径：用户粘几段大日志时，
+        # 上限必须是硬的。
+        flood = Agent.__new__(Agent)
+        flood.max_context_messages, flood.max_context_tokens = 40, 4000
+        flood.messages = [{"role": "user", "content": "报错日志：\n" + "Traceback\n" * 800}
+                          for _ in range(5)]
+        flood._trim_messages()
+        flood_size = _estimate_tokens(json.dumps(flood.messages, ensure_ascii=False))
+        within_budget = flood_size <= 4000 * 1.1 or len(flood.messages) == 1
         chat_probe = _probe_with(3000, _chat)
         # 条数没超但 token 预算超了的情况：锚点会在预算那一关被刷掉，
         # 所以判断依据必须是「它有没有活下来」，不是「在不在窗口里」。
@@ -5133,15 +5181,17 @@ def run_self_tests() -> str:
             chat_probe._trim_messages()
         ok = (
             _has_task(chat_probe) and _has_task(tool_probe)
+            and keeps_correction and within_budget
             and orphans == 0
             and tool_probe.messages[0].get("role") != "tool"
             and len(chat_probe.messages) < 61      # 确实裁掉了东西，不是啥也没做
         )
-        checks.append(("task_anchor_survives_trim", ok,
-                       f"纯对话 {'OK' if _has_task(chat_probe) else 'FAIL'}｜"
-                       f"带工具 {'OK' if _has_task(tool_probe) else 'FAIL'}｜孤儿 {orphans} 个"))
+        checks.append(("user_messages_survive_trim", ok,
+                       f"任务 {'OK' if _has_task(chat_probe) and _has_task(tool_probe) else 'FAIL'}｜"
+                       f"中途纠正 {'OK' if keeps_correction else 'FAIL'}｜"
+                       f"大日志不爆预算 {'OK' if within_budget else 'FAIL'}｜孤儿 {orphans} 个"))
     except Exception as e:
-        checks.append(("task_anchor_survives_trim", False, str(e)))
+        checks.append(("user_messages_survive_trim", False, str(e)))
     try:
         # 改文件是这个 agent 最容易造成真实损失的动作，却一直没被自检覆盖。
         # 最要紧的是 edit_file 的唯一性保证：old_str 不唯一时必须拒绝，

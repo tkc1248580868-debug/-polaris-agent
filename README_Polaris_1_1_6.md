@@ -213,13 +213,17 @@ means a more careful strategy, not a smaller budget.
   a determined attacker — real isolation means running Polaris in a container or
   under a dedicated low-privilege account.
 - **Sub-agents** no longer write into the main conversation archive or trace tree.
-- **The task statement is never trimmed away.** Trimming drops the oldest
-  messages first, and the oldest message is the one that says what the job *is*.
-  Measured on a 61-message session: "refactor login to use JWT, leave the database
-  alone" was gone, while twenty-odd "ok, step 16" replies survived. The agent kept
-  working without knowing what it was working on. The first user message is now
-  kept regardless of age — it costs nothing extra, since the same number of
-  messages is dropped either way.
+- **What you said survives trimming; tool output makes way.** Trimming drops the
+  oldest messages first, and the oldest messages are the ones stating what the job
+  *is*. Measured on a 34-message coding session: "refactor login to JWT, don't
+  touch database.py" was gone, and so was the mid-session correction "wait, use
+  RS256" — while sixteen large tool results survived. Losing a correction is worse
+  than losing everything: the agent confidently continues with the superseded plan.
+  User messages are now kept in preference to tool output. In that session all of
+  them together came to 22 tokens, 0.3% of the context — they are short, and they
+  are the part that cannot be recovered by reading a file again. The reservation is
+  capped at half the budget, so pasting three huge logs cannot blow the context
+  through this path.
 - **History is trimmed by token budget, not just message count.** Counting
   messages was survivable while every tool result was capped at 8,000 characters.
   Once `read_file` could return 24,000, forty such messages came to roughly
