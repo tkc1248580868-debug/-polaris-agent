@@ -98,6 +98,22 @@ def _fit_display(text: str, width: int) -> str:
             break
         out += ch
     return out + "…"
+def _as_str_list(value: Any) -> list[str]:
+    """把模型传来的「一组字符串」参数规范化。
+
+    工具签名写的是 list[str]，但模型完全可能直接传一个字符串。
+    Python 的 for 会把字符串按字符迭代，于是 set_todos("买牛奶") 变成
+    「买」「牛」「奶」三条待办，而且原清单已经被覆盖掉了；
+    delegate_tasks 遇到同样的输入会派出 3 个真实的子代理会话。
+    单个字符串按「一项」处理——这几乎肯定是模型的本意，
+    也比悄悄炸成一堆单字安全得多。"""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    elif not isinstance(value, (list, tuple, set)):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
 def _truncate_text(text: str, limit: int = 8000) -> str:
     if len(text) <= limit:
         return text
@@ -347,6 +363,8 @@ EMBED_DIM = max(32, int(os.environ.get("POLARIS_EMBED_DIM", "1024")))
 EMBED_BATCH_CAP = max(16, int(os.environ.get("POLARIS_EMBED_BATCH_CAP", "256")))
 # 嵌入请求的超时（秒）。设 0 表示用 SDK 默认值（600 秒，基本等于不超时）。
 EMBED_TIMEOUT = float(os.environ.get("POLARIS_EMBED_TIMEOUT", "30"))
+# 一次 delegate_tasks 最多能派几个子代理。每个都是真实的 LLM 会话，要花钱。
+MAX_PARALLEL_TASKS = max(1, int(os.environ.get("POLARIS_MAX_PARALLEL_TASKS", "8")))
 # 遗忘曲线：R = exp(-t / S)。低于这个保持率且长期没被想起的记忆转入休眠（不删除）。
 MEMORY_FORGET_THRESHOLD = float(os.environ.get("POLARIS_MEMORY_FORGET_THRESHOLD", "0.05"))
 MEMORY_DORMANT_MIN_DAYS = float(os.environ.get("POLARIS_MEMORY_DORMANT_MIN_DAYS", "3"))
@@ -962,7 +980,7 @@ class Memory:
             lines.extend("  " + self.describe(m, now) for m in dormant[:limit])
         return "\n".join(lines)
 MEMORY = Memory()
-@tool
+@tool(mutating=True)
 def remember(content: str, category: str = "fact") -> str:
     """把一条需要跨会话长期保留的事实、偏好或教训写入长期记忆。
     只用于确实值得下次还记得的信息（用户偏好、项目约定、踩过的坑），不要用它记录当前对话里的临时内容。
@@ -982,7 +1000,7 @@ def recall_memories(keyword: str = "", limit: int = 50) -> str:
     if not hits:
         return "(没有匹配的记忆)"
     return "\n".join(f"#{m['id']} [{m['category']}] {m['time']}: {m['content']}" for m in hits)
-@tool
+@tool(dangerous=True, mutating=True)
 def forget_memory(memory_id: int) -> str:
     """按编号删除一条长期记忆，编号从 recall_memories 的输出里取。
     仅在确认某条记忆已经过时或本身就是错的时候使用。
@@ -993,7 +1011,7 @@ def memory_status() -> str:
     """查看长期记忆的遗忘曲线状态：哪些记得清楚、哪些正在淡忘、哪些已经休眠。
     想知道自己是不是快忘了某件事、或者要不要主动复习一遍的时候用。"""
     return MEMORY.curve_report()
-@tool
+@tool(mutating=True)
 def reinforce_memory(memory_id: int, pin: bool = False) -> str:
     """强化一条长期记忆，让它衰减得更慢——相当于主动复习一遍。
     用户重申某件事、或者某条记忆再次被证明重要时使用；pin=true 则设为常驻，永不休眠。
@@ -1047,13 +1065,17 @@ class TodoList:
             return ""
         return "\n".join(f"{i}. [{'x' if it['done'] else ' '}] {it['text']}" for i, it in enumerate(self.items, 1))
 TODOS = TodoList()
-@tool
+@tool(mutating=True)
 def set_todos(todos: list[str]) -> str:
     """用一组新任务整体覆盖当前待办清单，适合在开始多步任务前先把计划列出来。
     注意是整体替换而不是追加，调用时要把还没做完的旧任务一起带上。"""
-    TODOS.set(todos)
+    items = _as_str_list(todos)
+    if not items:
+        # 传了但解析不出内容时，不能默默把旧清单清空。
+        return "错误：todos 需要是一组任务文本，收到的内容解析不出任何任务。当前清单保持不变。"
+    TODOS.set(items)
     return "Task list updated:\n" + (TODOS.render() or "(empty)")
-@tool
+@tool(mutating=True)
 def complete_todo(index: int) -> str:
     """把待办清单第 index 项标记为已完成，序号从 1 开始，对应 set_todos 传入的顺序。"""
     if TODOS.complete(index):
@@ -3494,9 +3516,14 @@ def delegate_tasks(tasks: list[str], context: str = "") -> str:
     """并行执行多个彼此独立的子任务（最多同时 4 个），返回按序号汇总的结果。
     仅当各任务之间没有依赖关系时使用；有先后依赖请改成多次调用 delegate_task。
     和 delegate_task 一样，每条任务描述都要自包含。"""
-    items = [str(t).strip() for t in tasks if str(t).strip()]
+    items = _as_str_list(tasks)
     if not items:
         return "(空任务列表)"
+    # 每一项都是一次真实的子代理 LLM 会话。参数畸形时不设上限的话，
+    # 一个 30 字符的字符串就等于 30 次调用——真金白银。
+    if len(items) > MAX_PARALLEL_TASKS:
+        return (f"错误：一次最多并行 {MAX_PARALLEL_TASKS} 个子任务，收到 {len(items)} 个。"
+                f"请合并任务，或分多次调用。")
     parent_context = CURRENT_AGENT_CONTEXT.get("shared_context", "").strip()
     print(f"\n    [子代理] 并行启动 {len(items)} 个任务...")
     results: list[tuple[int, str]] = []
@@ -5233,6 +5260,104 @@ def run_self_tests() -> str:
                            "old_str 不唯一/不存在都拒绝且不动文件，唯一时正确替换"))
     except Exception as e:
         checks.append(("file_edit_safety", False, str(e)))
+    try:
+        # 高危命令的拦截必须走 run_shell 本身。
+        # 原来的 shell_guard 测的是 _shell_deny_reason() 这个辅助函数，
+        # 从没经过工具——把 run_shell 里的拦截整段删掉，shell_guard 照样 PASS。
+        # 测辅助函数而不测接线，给的是虚假的安全感。
+        with tempfile.TemporaryDirectory() as tmp:
+            canary = os.path.join(tmp, "canary.txt")
+            _atomic_write_text(canary, "still here")
+            blocked = run_shell(f"rm -rf {tmp} # 高危演练")
+            refused = blocked.startswith("已拒绝执行") and _looks_like_tool_failure(blocked)
+            not_executed = os.path.exists(canary)   # 关键：不能只看返回值，要看它真没执行
+            normal = run_shell("echo ok")
+            works = normal.startswith("退出码 0") and "ok" in normal
+            ok = refused and not_executed and works
+            checks.append(("shell_guard_via_tool", ok,
+                           f"拦截 {'OK' if refused else 'FAIL'}｜"
+                           f"确实没执行 {'OK' if not_executed else 'FAIL'}｜日常命令不误伤 {'OK' if works else 'FAIL'}"))
+    except Exception as e:
+        checks.append(("shell_guard_via_tool", False, str(e)))
+    try:
+        # run_python 的沙箱在整套自检里被调用过 0 次——而注释里白纸黑字记着
+        # 这里已经静默出过一次事（_safe_import 定义了却没装进 SAFE_BUILTINS，
+        # 白名单等于完全没生效）。出过事、修好了、依然没有网。
+        escapes = {
+            "import os": "import os\nprint(os.getcwd())",
+            "import subprocess": "import subprocess\nprint(subprocess)",
+            "dunder 链": "print((1).__class__.__mro__[-1].__subclasses__())",
+            "open": "print(open('/etc/passwd'))",
+            "eval": "print(eval('1+1'))",
+        }
+        leaked = []
+        for label, code in escapes.items():
+            out = run_python(code)
+            # 逃逸成功的标志是「跑出了结果」；被挡住时沙箱会抛异常打 traceback
+            if "Traceback" not in out and "Error" not in out and "错误" not in out:
+                leaked.append(label)
+        # 正向用例：白名单里的模块必须还能用，否则「全都挡住」也算坏了
+        allowed = run_python("import math\nprint(math.sqrt(16))")
+        allowed_ok = "4.0" in allowed
+        # 沙箱是两层：AST 静态检查 + 运行时的 _safe_import。两层互为备份，
+        # 所以只坏一层的话，上面那些行为用例全都照样通过——实测确认过。
+        # 防御纵深是好事，但它让行为测试抓不到单层退化，所以这里额外确认
+        # 两层都还在。第三条尤其重要：_safe_import 定义了却没装进 SAFE_BUILTINS
+        # 正是这个项目历史上真实发生过的那次静默失效。
+        wrapper = _python_sandbox_wrapper()
+        layers = {
+            "AST 层": "isinstance(node, ast.Import)" in wrapper,
+            # 缩进要算进来：这句话在生成的沙箱代码里出现三次（运行时一次、
+            # AST 层两次），只按子串匹配的话，坏掉运行时那层也会在别处匹配上。
+            "运行时白名单": "\n    if root not in ALLOWED_IMPORTS:\n" in wrapper,
+            "白名单已接线": "SAFE_BUILTINS['__import__'] = _safe_import" in wrapper,
+        }
+        missing = [name for name, present in layers.items() if not present]
+        ok = not leaked and allowed_ok and not missing
+        checks.append(("python_sandbox_escapes", ok,
+                       f"逃逸 {len(leaked)} 例{('：' + '、'.join(leaked)) if leaked else ''}｜"
+                       f"白名单仍可用 {'OK' if allowed_ok else 'FAIL'}｜"
+                       f"防线完整 {'OK' if not missing else '缺 ' + '、'.join(missing)}"))
+    except Exception as e:
+        checks.append(("python_sandbox_escapes", False, str(e)))
+    try:
+        # 工具签名写 list[str]，但模型可能直接传字符串。
+        # Python 的 for 会按字符迭代，于是「买牛奶」变成三条待办，旧清单还被清空了。
+        original_todos = json.loads(json.dumps(TODOS.items, ensure_ascii=False))
+        TODOS.set(["原有任务"])
+        set_todos("买牛奶")
+        single = [item["text"] for item in TODOS.items] == ["买牛奶"]
+        TODOS.set(["原有任务"])
+        rejected = set_todos("").startswith("错误：") and [i["text"] for i in TODOS.items] == ["原有任务"]
+        TODOS.items = original_todos
+        TODOS.persist()
+        # delegate_tasks 同样的输入会派出真实的子代理会话，必须有上限
+        capped = delegate_tasks(["任务"] * (MAX_PARALLEL_TASKS + 1)).startswith("错误：")
+        ok = single and rejected and capped
+        checks.append(("tool_arg_coercion", ok,
+                       f"字符串当单项 {'OK' if single else 'FAIL'}｜"
+                       f"空输入不清空旧清单 {'OK' if rejected else 'FAIL'}｜"
+                       f"并行上限 {'OK' if capped else 'FAIL'}"))
+    except Exception as e:
+        checks.append(("tool_arg_coercion", False, str(e)))
+    try:
+        # 会写持久化状态的工具都必须标 mutating，否则 plan 模式的「只读」是假的。
+        # forget_memory 永久删记忆且没有 /undo，之前却连确认都不弹。
+        probe = Agent.__new__(Agent)
+        probe.tools = {t.schema["name"]: t for t in BUILTIN_TOOLS}
+        probe.mcp_servers, probe._mcp_tool_map, probe.tag = {}, {}, ""
+        probe.mode = "plan"
+        must_block = ["write_file", "edit_file", "run_shell", "run_python",
+                      "forget_memory", "set_todos", "complete_todo", "remember", "reinforce_memory"]
+        must_pass = ["read_file", "search_files", "recall_memories", "memory_status", "get_mood"]
+        leaked = [n for n in must_block if not probe._permission_denied(n)]
+        blocked_reads = [n for n in must_pass if probe._permission_denied(n)]
+        ok = not leaked and not blocked_reads
+        checks.append(("plan_mode_is_readonly", ok,
+                       f"漏网 {len(leaked)} 个{('：' + '、'.join(leaked)) if leaked else ''}｜"
+                       f"误伤只读 {len(blocked_reads)} 个"))
+    except Exception as e:
+        checks.append(("plan_mode_is_readonly", False, str(e)))
     try:
         lines = []
         for name, passed, detail in checks:

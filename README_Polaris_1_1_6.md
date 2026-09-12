@@ -165,7 +165,7 @@ file edit.
 
 ### Self-tests
 
-`/selftest` runs a twenty-five-check suite covering JSON parsing, context building,
+`/selftest` runs a twenty-nine-check suite covering JSON parsing, context building,
 snapshot round-trip, calculator sandbox escapes, shell guard rules, context
 starvation, step-budget direction, trace wiring, sub-agent isolation, tool
 description coverage, and three memory checks — curve direction and the spacing
@@ -213,6 +213,17 @@ means a more careful strategy, not a smaller budget.
   a determined attacker — real isolation means running Polaris in a container or
   under a dedicated low-privilege account.
 - **Sub-agents** no longer write into the main conversation archive or trace tree.
+- **`plan` mode is actually read-only now.** Only four tools were marked
+  `mutating`, so `forget_memory` — which permanently deletes a memory with no
+  `/undo` — sailed through read-only mode and never prompted for confirmation.
+  So did `set_todos`, `remember` and the rest. Every tool that writes persistent
+  state is marked now, and a check enumerates both directions: nothing that writes
+  gets through, nothing read-only gets blocked.
+- **List arguments are coerced, not iterated blindly.** `set_todos("买牛奶")`
+  turned one todo into three — 「买」「牛」「奶」 — because Python iterates a string
+  by character, and the old list was already overwritten by then. The same input to
+  `delegate_tasks` would have spawned one real sub-agent LLM session per character.
+  A bare string is now treated as a single item, and `delegate_tasks` has a hard cap.
 - **What you said survives trimming; tool output makes way.** Trimming drops the
   oldest messages first, and the oldest messages are the ones stating what the job
   *is*. Measured on a 34-message coding session: "refactor login to JWT, don't
