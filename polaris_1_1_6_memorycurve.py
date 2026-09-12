@@ -20,6 +20,7 @@ import tempfile
 import threading
 import traceback
 import types
+import unicodedata
 import uuid
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -42,6 +43,61 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+# ───────────────────────────────────────────────────────────────────────────────
+# 终端呈现：颜色与显示宽度
+#
+# 不引 rich 之类的库——「单文件 + 一个依赖」是这个项目的卖点，
+# 为了好看牺牲掉它不划算。纯 ANSI 转义码够用，连 import 都省了。
+# ───────────────────────────────────────────────────────────────────────────────
+_STYLES = {
+    "reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m", "italic": "\033[3m",
+    "accent": "\033[38;5;111m",   # Polaris 的主色，一整套界面只用这一个彩色
+    "green": "\033[32m", "yellow": "\033[33m", "red": "\033[31m", "gray": "\033[90m",
+}
+def _color_enabled() -> bool:
+    """NO_COLOR 约定：这个变量只要存在（哪怕是空值）就关掉颜色。
+    非 TTY（管道、重定向、CI）也自动关——那些地方转义码只会变成乱码。"""
+    if "NO_COLOR" in os.environ:
+        return False
+    forced = os.environ.get("POLARIS_COLOR", "").strip().lower()
+    if forced in {"0", "off", "never"}:
+        return False
+    if forced in {"1", "on", "always"}:
+        return True
+    try:
+        return bool(sys.stdout.isatty())
+    except Exception:
+        return False
+_COLOR = _color_enabled()
+def paint(text: str, *styles: str) -> str:
+    """给文本上色。关掉颜色时原样返回，所以调用处不需要写 if。"""
+    if not _COLOR or not styles:
+        return text
+    prefix = "".join(_STYLES.get(s, "") for s in styles)
+    return f"{prefix}{text}{_STYLES['reset']}" if prefix else text
+def _display_width(text: str) -> int:
+    """终端里的实际显示宽度：中日韩字符占两格。
+
+    按 len() 补空格是对不齐的——横幅那两列以前就歪在这上面，
+    第二列散落在第 35/36/37/38 格四个位置。"""
+    width = 0
+    for ch in text:
+        if unicodedata.combining(ch):
+            continue
+        width += 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+    return width
+def _pad_display(text: str, width: int) -> str:
+    return text + " " * max(0, width - _display_width(text))
+def _fit_display(text: str, width: int) -> str:
+    """按显示宽度截断，超出部分用省略号，不会把中文截成半个。"""
+    if _display_width(text) <= width:
+        return text
+    out = ""
+    for ch in text:
+        if _display_width(out) + _display_width(ch) > width - 1:
+            break
+        out += ch
+    return out + "…"
 def _truncate_text(text: str, limit: int = 8000) -> str:
     if len(text) <= limit:
         return text
@@ -4168,13 +4224,15 @@ class Agent:
         if self.quiet or not piece:
             return
         if not self._thinking_open:
-            header = f"{self.tag}✦ 思考" if self.tag else "✦ 思考"
-            print(f"\n{header}\n{self.tag}  ", end="", flush=True)
+            header = paint("✳ 思考", "accent")
+            print(f"\n{self.tag}{header}\n{self.tag}  ", end="", flush=True)
             self._thinking_open = True
         print(piece.replace("\n", f"\n{self.tag}  "), end="", flush=True)
     def _end_thinking(self) -> None:
         if self._thinking_open:
-            print(f"\n{self.tag}  ───────────────" if self.tag else "\n  ───────────────", flush=True)
+            # 思考和正文靠颜色区分就够了，不用再画分隔线——
+            # 每一步都来一条，短思考会被装饰淹没。
+            print(flush=True)
             self._thinking_open = False
     def _fold_reasoning(self, content: str, native: str) -> str:
         """把模型的原生思考写进消息内容，让它和 <thinking> 走同一条因果链。
@@ -4308,7 +4366,9 @@ class Agent:
                 args = json.loads(args_str) if args_str.strip() else {}
             except Exception:
                 args = {}
-            print(f"\n{self.tag}  [工具] {name}({args_str[:160]})")
+            # 用统一的符号前缀让对话流可以一眼扫读：● 是动作，⎿ 是它的结果。
+            print(f"\n{self.tag}  " + paint("●", "accent") + " " + paint(name, "bold")
+                  + paint(f"({_fit_display(args_str, 120)})", "dim"))
             if self.trace_enabled:
                 TRACE_ENGINE.begin(f"Tool | {name}", args_str[:80], tool=name)
             started = time()
@@ -4321,7 +4381,9 @@ class Agent:
                 summary = f"{elapsed:.2f}s / {len(output)} 字符"
                 TRACE_ENGINE.finish(summary) if ok else TRACE_ENGINE.fail(f"失败 | {output.splitlines()[0][:80] if output else ''}")
             preview = output.replace("\n", " ")
-            print(f"{self.tag}  [结果] {preview[:150]}...\n")
+            mark = paint("⎿", "gray") if ok else paint("⎿", "red")
+            body = _fit_display(preview, 140)
+            print(f"{self.tag}    {mark} " + paint(body, "dim" if ok else "red"))
             dangerous, mutating = self._tool_flags(name)
             MOOD.record_tool(
                 name,
@@ -5368,38 +5430,122 @@ def handle_cli_command(agent: Agent, user_input: str) -> tuple[bool, str | None]
             f"工具档位：{agent.tool_profile}（约 {tool_profile_cost(agent.tool_profile)[1]:,} tokens/步，/cost 看明细）",
         ]))
         return True, None
+    if command in {"help", "h", "?"}:
+        print(render_help())
+        return True, None
     if command == "init":
         return True, INIT_PROMPT
-    return False, None
-BANNER = """
-======================================================
-  Polaris v1.1.6 | Memory Curve | Trace + Workspace + Planner + Persona
-------------------------------------------------------
-  /mode [plan|ask|auto] 权限模式    /todo       任务清单
-  /init  生成项目 AGENT.md          /undo       回退文件
-  /memory [n] 查看长期记忆         /tools      工具列表
-  /mood   查看心情状态               /diary      查看心情日记
-  /reason 查看决策引擎               /state      查看整体状态
-  /insight 查看工作区洞察             /plan       生成任务计划
-  /workspace 查看项目世界模型        /history    查看上一个窗口
-  /experience 查看共同经历           /timeline   查看历史时间线
-  /plugins 查看已加载插件           /searchmem  搜索记忆
-  /searchws 搜索工作区文件          /searchchat 搜索全部对话
-  /searchlast 搜索上一个窗口        /refreshws  刷新世界模型
-  /journal   成长日志                /stats      统计概览
-  /snapshot  保存当前状态           /snapshots  列出快照
-  /restore   恢复状态快照            /selftest   运行自检
-  /remember 写入长期记忆            /doctor     系统诊断
-  /forget 编号 删除一条记忆         /reflect    开关自检
-  /recall 语义召回记忆              /memstat    记忆遗忘曲线
-  /lean [档位] 精简工具省 token     /cost       每步开销估算
-  /pin 编号 记忆设为常驻            /revive 编号 唤醒休眠记忆
-  /thought [on|off|preview] 思考轨迹 /persona    人格设定
-  /reflection [on|off|preview] 同步心境
-  /relationship 关系状态            /trace [n|json] 执行轨迹
-  exit  退出
-======================================================
-"""
+    print(paint(f"未知命令 /{command}。输入 /help 查看全部命令。", "yellow"))
+    return True, None
+# ───────────────────────────────────────────────────────────────────────────────
+# 命令目录：横幅只露出最常用的几条，其余交给 /help
+#
+# 旧版把 43 条命令全平铺在开屏，27 行——新用户根本看不出哪几条是现在要用的。
+# 信息不是越多越好，第一屏要能让人知道下一步做什么。
+# ───────────────────────────────────────────────────────────────────────────────
+COMMAND_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
+    ("会话", [
+        ("/help", "查看全部命令"),
+        ("/mode [plan|ask|auto]", "权限模式：只读 / 每步确认 / 放手去做"),
+        ("/reset", "清空当前会话与待办"),
+        ("/reflect", "开关每回合的自我检查"),
+        ("/thought [on|off|preview]", "思考轨迹的显示方式"),
+        ("exit", "退出"),
+    ]),
+    ("记忆", [
+        ("/memory [n]", "查看长期记忆与它们的遗忘曲线"),
+        ("/recall <查询>", "语义召回，带相似度与保持率明细"),
+        ("/memstat", "记忆整体状态：清晰 / 正在淡忘 / 已休眠"),
+        ("/remember [-c 类别] <内容>", "手动写入一条长期记忆"),
+        ("/forget <编号>", "删除一条记忆"),
+        ("/pin <编号>", "设为常驻，永不衰减"),
+        ("/unpin <编号>", "取消常驻"),
+        ("/revive <编号>", "唤醒一条已休眠的记忆"),
+        ("/searchmem <查询>", "按关键词搜索记忆"),
+    ]),
+    ("工作与文件", [
+        ("/plan <目标>", "把目标拆成可执行步骤"),
+        ("/todo", "当前任务清单"),
+        ("/undo", "回退上一次文件修改"),
+        ("/workspace", "项目世界模型"),
+        ("/insight", "依赖健康度与耦合热点"),
+        ("/refreshws", "重新扫描工作区"),
+        ("/searchws <查询>", "搜索工作区文件"),
+        ("/init", "生成项目的 AGENT.md"),
+    ]),
+    ("观察", [
+        ("/trace [n|json]", "上一回合到底做了什么"),
+        ("/cost", "每步 token 开销与各档位对比"),
+        ("/lean [档位]", "精简工具集省 token"),
+        ("/stats", "统计概览"),
+        ("/doctor", "系统诊断"),
+        ("/selftest", "运行内置自检"),
+        ("/tools", "当前暴露给模型的工具"),
+        ("/plugins", "已加载的插件"),
+    ]),
+    ("内在状态", [
+        ("/state", "心情 / 决策 / 世界模型 / 共同经历"),
+        ("/mood", "心情状态"),
+        ("/diary", "心情日记"),
+        ("/persona", "人格设定"),
+        ("/relationship", "关系状态"),
+        ("/reason", "决策引擎"),
+        ("/journal", "成长日志"),
+    ]),
+    ("历史", [
+        ("/history", "上一个对话窗口"),
+        ("/experience", "共同经历"),
+        ("/timeline", "历史时间线"),
+        ("/searchchat <查询>", "搜索全部对话"),
+        ("/searchlast <查询>", "搜索上一个窗口"),
+        ("/snapshot", "保存运行时状态快照"),
+        ("/snapshots", "列出快照"),
+        ("/restore <编号>", "恢复快照"),
+    ]),
+]
+# 开屏只露这几条：一个新用户真正需要的最小集合
+BANNER_COMMANDS = [
+    ("/help", "全部命令"), ("/mode", "权限模式"),
+    ("/memory", "长期记忆"), ("/trace", "执行轨迹"),
+    ("/cost", "开销估算"), ("/lean", "精简省 token"),
+    ("/undo", "回退文件"), ("/selftest", "运行自检"),
+]
+def _box(lines: list[str], width: int = 58) -> list[str]:
+    """圆角边框。先按显示宽度补齐再上色——反过来做的话，
+    转义码会被算进宽度里，边框就参差不齐了。"""
+    top = paint("╭" + "─" * (width - 2) + "╮", "accent")
+    bottom = paint("╰" + "─" * (width - 2) + "╯", "accent")
+    body = []
+    for line, styles in lines:
+        padded = _pad_display(_fit_display(line, width - 4), width - 4)
+        bar = paint("│", "accent")
+        body.append(f"{bar} {paint(padded, *styles)} {bar}")
+    return [top, *body, bottom]
+def render_banner() -> str:
+    out = _box([
+        (f"Polaris v{VERSION} · {CODENAME}", ("bold",)),
+        ("记忆会遗忘，思考留痕迹，人格在生长", ("dim",)),
+    ])
+    out.append("")
+    half = (len(BANNER_COMMANDS) + 1) // 2
+    left, right = BANNER_COMMANDS[:half], BANNER_COMMANDS[half:]
+    for i in range(half):
+        row = "  "
+        for cmd, desc in ((left[i],) + ((right[i],) if i < len(right) else ())):
+            row += paint(_pad_display(cmd, 11), "accent") + _pad_display(desc, 17)
+        out.append(row.rstrip())
+    total = sum(len(items) for _, items in COMMAND_GROUPS)
+    out.append("")
+    out.append(paint(f"  输入 /help 查看全部 {total} 条命令", "dim"))
+    return "\n".join(out)
+def render_help() -> str:
+    out = []
+    for group, items in COMMAND_GROUPS:
+        out.append(paint(f"\n{group}", "bold", "accent"))
+        width = max(_display_width(cmd) for cmd, _ in items) + 2
+        for cmd, desc in items:
+            out.append("  " + paint(_pad_display(cmd, width), "accent") + paint(desc, "dim"))
+    return "\n".join(out)
 def main():
     if BACKEND_NAME in {"ollama", "lmstudio", "local"}:
         pass
@@ -5409,32 +5555,32 @@ def main():
         return
     WORKSPACE.refresh()
     agent = Agent(tools=BUILTIN_TOOLS)
-    print(BANNER)
-    print(f"当前统一模型配置: {MODEL}")
-    print(f"快照目录: {SNAPSHOT_DIR}")
-    print(f"当前后端配置: {BACKEND_NAME}")
-    if _looks_local_endpoint(BASE_URL) or BACKEND_NAME in {"ollama", "lmstudio", "local"}:
-        print("提示：当前是本地/兼容服务模式；Polaris 不内置假后端，需由 Ollama/LM Studio 等提供 OpenAI-Compatible 接口。")
+    print(render_banner())
+    # 旧版在这里一口气打印 11 行内部状态，人格那行 150 格宽，窄终端上直接折成一团。
+    # 现在压成两行摘要，完整信息本来就有 /state、/doctor、/persona 可以看。
+    tools_n, tools_t = tool_profile_cost(agent.tool_profile)
+    line1 = f"模型 {MODEL} · 后端 {agent.backend_name} · 工具 {agent.tool_profile}({tools_n})"
     if BASE_URL:
-        print(f"当前自定义 API 接口端点: {BASE_URL}")
+        line1 += f" · 端点 {_fit_display(BASE_URL, 28)}"
+    mood_label = MOOD.label()
+    line2 = (f"记忆 {len(MEMORY.items)} 条 · 心情 {mood_label} · "
+             f"信任 {RELATIONSHIP.state.get('trust', 0)} · {WORKSPACE.compact()}")
+    print(paint("  " + _fit_display(line1, 72), "dim"))
+    print(paint("  " + _fit_display(line2, 72), "dim"))
+    extras = []
     if agent.instructions:
-        print("已动态注入自定义指令配置。")
-    if MEMORY.items:
-        print(f"已成功唤醒 {len(MEMORY.items)} 条长期记忆数据。")
+        extras.append("已注入项目自定义指令")
     if agent.loaded_plugins:
-        print(f"已加载插件：{len(agent.loaded_plugins)} 个。")
-    print(f"当前人格画像：{PERSONA.compact()}")
-    print(f"当前关系状态：{RELATIONSHIP.compact()}")
-    print(f"当前心情状态：{MOOD.compact()}")
-    print(f"当前决策引擎：{REASON.compact()}")
-    print(f"当前世界模型：{WORKSPACE.compact()}")
-    print(f"共同经历：{EXPERIENCE.compact()}")
-    print(f"历史档案：{ARCHIVE.last_session_id() or '暂无'}")
+        extras.append(f"插件 {len(agent.loaded_plugins)} 个")
+    if _looks_local_endpoint(BASE_URL) or BACKEND_NAME in {"ollama", "lmstudio", "local"}:
+        extras.append("本地兼容服务模式")
+    if extras:
+        print(paint("  " + " · ".join(extras), "dim"))
     while True:
         try:
-            user_input = input("\n你 > ").strip()
+            user_input = input(paint("\n你 ", "accent") + paint("› ", "dim")).strip()
         except (KeyboardInterrupt, EOFError):
-            print("\n再见！")
+            print(paint("\n再见！", "dim"))
             break
         if not user_input:
             continue

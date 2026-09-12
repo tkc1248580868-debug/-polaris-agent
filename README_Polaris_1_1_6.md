@@ -428,6 +428,7 @@ Every file write is checkpointed first — `/undo` restores the previous version
 | `/undo` | Roll back the last file edit |
 | `/mode` · `/reset` · `/reflect` | Permission mode; clear session; toggle self-check |
 | `/tools` · `/plugins` · `/init` | Tool list; loaded plugins; generate `AGENT.md` |
+| `/help` | Every command, grouped by what it is for |
 | `/lean [profile]` · `/cost` | Shrink the exposed toolset; show the per-step token bill |
 
 ---
@@ -450,6 +451,7 @@ Every file write is checkpointed first — `/undo` restores the previous version
 | `POLARIS_TOOL_PROFILE` | `full` | `full` · `code` · `min` · `read`. Which built-in tools are exposed to the model — the single biggest lever on token cost. |
 | `POLARIS_CONTEXT_POSITION` | `tail` | Where volatile runtime state goes. `tail` keeps the cache prefix stable; `system` is the pre-1.1.6 layout. |
 | `POLARIS_MAX_CONTEXT_TOKENS` | `32000` | Token budget for the conversation history. Lower it for small local models. |
+| `POLARIS_COLOR` | auto | `1`/`0` to force colour on or off. Off automatically when not a TTY. `NO_COLOR` is honoured. |
 | `POLARIS_SHELL_ALLOW_DANGEROUS` | `false` | Lift the destructive-command block. |
 | `MINIAGENT_PLUGIN_DIRS` | `plugins` | Comma-separated plugin directories. |
 | `POLARIS_EMBED_BACKEND` | `auto` | `auto` · `remote` · `local`. `auto` uses the remote model when an endpoint is configured, else the local hash embedder. |
