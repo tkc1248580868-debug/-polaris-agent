@@ -1,0 +1,51 @@
+name: selftest
+
+# 每次推送和 PR 都跑一遍内置自检。不需要 API key，几秒钟跑完。
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  selftest:
+    name: selftest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # README 写的是 3.10+，那就把 3.10 到 3.13 都跑一遍，
+        # 免得哪天用了新语法却没人发现下限已经被抬高了。
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+      - name: 语法检查
+        run: python -m py_compile polaris_1_1_6_memorycurve.py
+      - name: 运行自检
+        run: python polaris_1_1_6_memorycurve.py --selftest
+
+  no-dependencies:
+    # README 宣称「只有 openai 一个依赖，其余全来自标准库」。
+    # 这个 job 就是来验这句话的：一个包都不装，照样要能导入并跑完自检。
+    name: 零依赖也能跑
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 确认环境里确实没有 openai
+        run: |
+          python -c "
+          import importlib.util, sys
+          if importlib.util.find_spec('openai') is not None:
+              sys.exit('环境里装了 openai，这个 job 就失去意义了')
+          print('确认：没有 openai')
+          "
+      - name: 不装任何依赖，直接跑自检
+        run: python polaris_1_1_6_memorycurve.py --selftest

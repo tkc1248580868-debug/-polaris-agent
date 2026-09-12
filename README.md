@@ -2,6 +2,7 @@
 
 **An AI that grows with you.**
 
+[![selftest](https://github.com/tkc1248580868-debug/-polaris-agent/actions/workflows/selftest.yml/badge.svg)](https://github.com/tkc1248580868-debug/-polaris-agent/actions/workflows/selftest.yml)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Dependencies](https://img.shields.io/badge/dependencies-1-brightgreen)
@@ -43,12 +44,14 @@ python polaris_1_1_6_memorycurve.py
 
 Verify the install without spending a single token:
 
-```
-/selftest
+```bash
+python polaris_1_1_6_memorycurve.py --selftest    # exits non-zero if anything fails
 ```
 
-Thirteen checks covering the sandbox, the shell guard, context assembly, the
-trace tree, and the memory curve. No API key required.
+or `/selftest` from inside a session.
+
+Twenty-four checks covering the sandbox, the shell guard, file-edit safety,
+context assembly, the trace tree, and the memory curve. No API key required.
 
 **Requirements:** Python 3.10+, and an OpenAI-compatible endpoint.
 Works on Windows, Linux, and macOS. The only dependency is `openai` — every

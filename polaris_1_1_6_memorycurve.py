@@ -2712,6 +2712,9 @@ class SnapshotManager:
                 items.append(data)
         return items
     def capture(self, label: str = "") -> dict:
+        # 目录不能只在 __init__ 里建一次：用户手动删掉 .polaris_snapshots/、
+        # 或者进程中途换了工作目录，写入就会 FileNotFoundError 直接崩。
+        self.root.mkdir(parents=True, exist_ok=True)
         snapshot_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         payload = {
             "id": snapshot_id,
@@ -5005,6 +5008,47 @@ def run_self_tests() -> str:
     except Exception as e:
         checks.append(("context_token_budget", False, str(e)))
     try:
+        # 改文件是这个 agent 最容易造成真实损失的动作，却一直没被自检覆盖。
+        # 最要紧的是 edit_file 的唯一性保证：old_str 不唯一时必须拒绝，
+        # 否则模型以为自己改了 A 处，实际改的是先出现的 B 处，而且悄无声息。
+        with tempfile.TemporaryDirectory() as tmp:
+            # 写类工具都会先记回滚点，所以需要一个 Agent 上下文；
+            # 顺带也验证了回滚点确实被记下来了（/undo 有东西可回）。
+            probe = Agent.__new__(Agent)
+            probe.checkpoints = []
+            saved_context = CURRENT_AGENT_CONTEXT.copy()
+            CURRENT_AGENT_CONTEXT.update({"agent": probe})
+            path = os.path.join(tmp, "sample.py")
+            body = "def a():\n    return 1\n\ndef b():\n    return 1\n"
+            _atomic_write_text(path, body)
+            # 出现两次 → 必须拒绝，且文件一个字都不能动
+            ambiguous = edit_file(path, "    return 1", "    return 2")
+            untouched = open(path, encoding="utf-8").read() == body
+            # 完全不存在 → 同样拒绝
+            missing = edit_file(path, "does not exist", "x")
+            # 带上下文变唯一 → 正常替换
+            done = edit_file(path, "def b():\n    return 1", "def b():\n    return 2")
+            after = open(path, encoding="utf-8").read()
+            ok = (
+                ambiguous.startswith("错误：") and untouched
+                and missing.startswith("错误：")
+                and _looks_like_tool_failure(ambiguous) and _looks_like_tool_failure(missing)
+                and done.startswith("替换成功")
+                and after == "def a():\n    return 1\n\ndef b():\n    return 2\n"
+            )
+            # write_file 覆盖写也要真的落盘
+            target = os.path.join(tmp, "new.txt")
+            write_file(target, "内容")
+            ok = ok and open(target, encoding="utf-8").read() == "内容"
+            # 被拒绝的那两次不该留下回滚点，成功的两次要留下
+            ok = ok and len(probe.checkpoints) == 2
+            CURRENT_AGENT_CONTEXT.clear()
+            CURRENT_AGENT_CONTEXT.update(saved_context)
+            checks.append(("file_edit_safety", ok,
+                           "old_str 不唯一/不存在都拒绝且不动文件，唯一时正确替换"))
+    except Exception as e:
+        checks.append(("file_edit_safety", False, str(e)))
+    try:
         lines = []
         for name, passed, detail in checks:
             status = "PASS" if passed else "FAIL"
@@ -5406,5 +5450,24 @@ def main():
             agent.chat(user_input)
         except Exception as e:
             print(f"\n[运行异常] {e}")
+def run_selftest_cli() -> int:
+    """命令行方式跑自检，返回退出码：0 全过，1 有检查没过。
+
+    给 CI 用，也给「我刚装好，这东西到底能不能跑」用——不需要 API key。
+    自检会往当前目录写状态文件（心情 / 待办 / 快照），所以跑在临时目录里，
+    免得弄脏用户的项目或者 CI 的检出目录。"""
+    cwd = os.getcwd()
+    with tempfile.TemporaryDirectory(prefix="polaris_selftest_") as tmp:
+        try:
+            os.chdir(tmp)
+            report = run_self_tests()
+        finally:
+            os.chdir(cwd)
+    print(report)
+    # run_self_tests 出大问题时会直接返回 traceback，那种情况也要算失败，
+    # 所以判定条件是「必须明确出现通过标记」，而不是「没看到 FAIL」。
+    return 0 if "ALL CHECKS PASSED" in report else 1
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] in {"--selftest", "-t"}:
+        sys.exit(run_selftest_cli())
     main()

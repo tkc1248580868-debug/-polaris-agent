@@ -165,15 +165,27 @@ file edit.
 
 ### Self-tests
 
-`/selftest` runs a twenty-three-check suite covering JSON parsing, context building,
+`/selftest` runs a twenty-four-check suite covering JSON parsing, context building,
 snapshot round-trip, calculator sandbox escapes, shell guard rules, context
 starvation, step-budget direction, trace wiring, sub-agent isolation, tool
 description coverage, and three memory checks — curve direction and the spacing
 effect, vector recall with cross-process determinism, and forgetting behaviour
 (dormancy without deletion, cued recall, legacy migration), the MCP permission
 gate, the embedding timeout, file paging, shell exit-code reporting, streaming
-tool-call assembly, and whether the chain of thought is actually causal.
-No API key required.
+tool-call assembly, whether the chain of thought is actually causal, and the
+file-editing safety rules. No API key required.
+
+It runs in CI too. `python polaris_1_1_6_memorycurve.py --selftest` exits non-zero
+if any check fails, and GitHub Actions runs it on every push across Python
+3.10–3.13 — plus one job with **no dependencies installed at all**, which exists to
+keep the "one dependency" claim honest rather than aspirational.
+
+The `file_edit_safety` check was added when the CI was being set up, for a reason
+worth recording: deleting `edit_file`'s uniqueness guard — the single most
+dangerous regression in the tool set, since it silently rewrites the *first*
+match instead of the intended one — left the suite entirely green. A CI that
+cannot fail is worse than no CI, so the check that catches it went in before the
+workflow did.
 
 ### Step budget: direction reversed
 
