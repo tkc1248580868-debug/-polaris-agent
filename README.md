@@ -200,6 +200,13 @@ releases.
 Contributions of all kinds are welcome — bug reports, documentation, ideas, or
 code. Open an issue or a pull request.
 
+**On how this was built.** Polaris is developed with AI coding tools — Codex and
+Claude Code. I set the direction, make the architectural calls, and review what
+goes in; the agents do a large share of the typing. The commit history shows who
+did what, and commits made with Claude Code carry a `Co-Authored-By` trailer.
+
+Saying so costs nothing and seems more useful than letting anyone guess.
+
 ---
 
 ## Disclaimer
