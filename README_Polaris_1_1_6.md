@@ -165,7 +165,7 @@ file edit.
 
 ### Self-tests
 
-`/selftest` runs a twenty-four-check suite covering JSON parsing, context building,
+`/selftest` runs a twenty-five-check suite covering JSON parsing, context building,
 snapshot round-trip, calculator sandbox escapes, shell guard rules, context
 starvation, step-budget direction, trace wiring, sub-agent isolation, tool
 description coverage, and three memory checks — curve direction and the spacing
@@ -213,6 +213,13 @@ means a more careful strategy, not a smaller budget.
   a determined attacker — real isolation means running Polaris in a container or
   under a dedicated low-privilege account.
 - **Sub-agents** no longer write into the main conversation archive or trace tree.
+- **The task statement is never trimmed away.** Trimming drops the oldest
+  messages first, and the oldest message is the one that says what the job *is*.
+  Measured on a 61-message session: "refactor login to use JWT, leave the database
+  alone" was gone, while twenty-odd "ok, step 16" replies survived. The agent kept
+  working without knowing what it was working on. The first user message is now
+  kept regardless of age — it costs nothing extra, since the same number of
+  messages is dropped either way.
 - **History is trimmed by token budget, not just message count.** Counting
   messages was survivable while every tool result was capped at 8,000 characters.
   Once `read_file` could return 24,000, forty such messages came to roughly

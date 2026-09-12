@@ -3994,6 +3994,18 @@ class Agent:
                 with open(path, encoding="utf-8", errors="replace") as f:
                     parts.append(f"[来自 {path} 的指令]\n{_truncate_text(f.read().strip(), 1200)}")
         return "\n\n".join(parts)
+    def _task_anchor(self) -> dict | None:
+        """第一条用户消息——也就是「这次到底要干什么」。
+
+        按时间裁剪时它最老，所以第一个被删；而它恰恰是最不该删的那条。
+        实测过：61 条消息裁到 28 条之后，「把登录模块重构成 JWT，
+        别动数据库」没了，二十几条「好的，第 16 步」留着。
+        于是 Agent 还在干活，却已经不知道自己在干嘛了。
+        这不是取舍，是 bug。"""
+        for msg in self.messages:
+            if msg.get("role") == "user":
+                return msg
+        return None
     def _keep_window(self) -> list[dict]:
         """按「条数」和「token 预算」两个上限取较紧的那个。
 
@@ -4002,16 +4014,28 @@ class Agent:
         这里从最新的一条往回收，收满预算为止；无论如何至少保留最后一条，
         否则一条超长消息会把整个历史清空。"""
         window = self.messages[-self.max_context_messages:]
+        def collect(budget: int) -> list[dict]:
+            kept: list[dict] = []
+            used = 0
+            for msg in reversed(window):
+                cost = _estimate_tokens(json.dumps(msg, ensure_ascii=False))
+                if kept and used + cost > budget:
+                    break
+                kept.append(msg)
+                used += cost
+            kept.reverse()
+            return kept
         budget = max(1000, self.max_context_tokens)
-        kept: list[dict] = []
-        used = 0
-        for msg in reversed(window):
-            cost = _estimate_tokens(json.dumps(msg, ensure_ascii=False))
-            if kept and used + cost > budget:
-                break
-            kept.append(msg)
-            used += cost
-        kept.reverse()
+        kept = collect(budget)
+        # 任务描述单独留一个位置。注意这不会多删任何东西——该删几条还是几条，
+        # 只是保证被删的那些里面不包含「要干什么」。
+        # 判断依据必须是「它有没有活下来」：条数没超但 token 预算超了的时候，
+        # 它照样会在上面那一关被刷掉。
+        anchor = self._task_anchor()
+        if anchor is not None and not any(msg is anchor for msg in kept):
+            reserve = _estimate_tokens(json.dumps(anchor, ensure_ascii=False))
+            kept = collect(max(1, budget - reserve))
+            kept.insert(0, anchor)
         return kept
     def _trim_messages(self) -> None:
         trimmed = self._keep_window()
@@ -5069,6 +5093,55 @@ def run_self_tests() -> str:
                        f"预算内 {'OK' if within else 'FAIL'}｜孤儿 tool_calls {orphans} 个｜超长单条不清空"))
     except Exception as e:
         checks.append(("context_token_budget", False, str(e)))
+    try:
+        # 任务描述（第一条用户消息）永远不能被裁掉。它最老，所以按时间裁剪时
+        # 第一个死——可它恰恰是「要干什么」。裁到一半 Agent 还在干活，
+        # 却已经不知道自己在干嘛了。
+        def _probe_with(tokens: int, build) -> Agent:
+            probe = Agent.__new__(Agent)
+            probe.max_context_messages, probe.max_context_tokens = 40, tokens
+            probe.messages = [{"role": "user", "content": "任务：把登录模块重构成 JWT"}]
+            build(probe)
+            probe._trim_messages()
+            return probe
+        def _chat(p):
+            for i in range(30):
+                p.messages.append({"role": "assistant", "content": f"好的，第 {i} 步"})
+                p.messages.append({"role": "user", "content": "继续。" + "闲聊内容。" * 30})
+        def _tools(p):
+            for i in range(10):
+                p.messages.append({"role": "assistant", "content": "", "tool_calls": [
+                    {"id": f"c{i}", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]})
+                p.messages.append({"role": "tool", "tool_call_id": f"c{i}", "name": "read_file",
+                                   "content": "内容" * 150})
+        def _has_task(p) -> bool:
+            return any("JWT" in (msg.get("content") or "") for msg in p.messages)
+        chat_probe = _probe_with(3000, _chat)
+        # 条数没超但 token 预算超了的情况：锚点会在预算那一关被刷掉，
+        # 所以判断依据必须是「它有没有活下来」，不是「在不在窗口里」。
+        tool_probe = _probe_with(800, _tools)
+        orphans = 0
+        for idx, msg in enumerate(tool_probe.messages):
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                need, got, j = len(msg["tool_calls"]), 0, idx + 1
+                while j < len(tool_probe.messages) and tool_probe.messages[j].get("role") == "tool":
+                    got += 1
+                    j += 1
+                if got < need:
+                    orphans += 1
+        for _ in range(5):  # 反复裁剪必须稳定，不能越裁越少
+            chat_probe._trim_messages()
+        ok = (
+            _has_task(chat_probe) and _has_task(tool_probe)
+            and orphans == 0
+            and tool_probe.messages[0].get("role") != "tool"
+            and len(chat_probe.messages) < 61      # 确实裁掉了东西，不是啥也没做
+        )
+        checks.append(("task_anchor_survives_trim", ok,
+                       f"纯对话 {'OK' if _has_task(chat_probe) else 'FAIL'}｜"
+                       f"带工具 {'OK' if _has_task(tool_probe) else 'FAIL'}｜孤儿 {orphans} 个"))
+    except Exception as e:
+        checks.append(("task_anchor_survives_trim", False, str(e)))
     try:
         # 改文件是这个 agent 最容易造成真实损失的动作，却一直没被自检覆盖。
         # 最要紧的是 edit_file 的唯一性保证：old_str 不唯一时必须拒绝，
