@@ -6,7 +6,7 @@
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Dependencies](https://img.shields.io/badge/dependencies-1-brightgreen)
-![Single file](https://img.shields.io/badge/single--file-4.7k%20lines-orange)
+![Single file](https://img.shields.io/badge/single--file-5.9k%20lines-orange)
 ![Version](https://img.shields.io/badge/version-1.1.6-lightgrey)
 
 An open-source autonomous AI agent with a persistent personality, long-term
@@ -50,7 +50,7 @@ python polaris_1_1_6_memorycurve.py --selftest    # exits non-zero if anything f
 
 or `/selftest` from inside a session.
 
-Twenty-four checks covering the sandbox, the shell guard, file-edit safety,
+Twenty-nine checks covering the sandbox, the shell guard, file-edit safety,
 context assembly, the trace tree, and the memory curve. No API key required.
 
 **Requirements:** Python 3.10+, and an OpenAI-compatible endpoint.
@@ -96,7 +96,7 @@ Every turn writes a structured execution trace you can actually read:
 
 ### One file, one dependency
 
-4,700 lines of Python, no framework, no vector database, no build step. Copy it
+5,900 lines of Python, no framework, no vector database, no build step. Copy it
 anywhere and run it.
 
 ---
@@ -119,7 +119,7 @@ anywhere and run it.
 | **MCP + Plugins** | Model Context Protocol over stdio; drop-in `plugins/*.py` |
 | **Safety** | Python sandbox, shell guard, file checkpoints, permission modes |
 
-35 built-in tools. 43 slash commands.
+35 built-in tools. 45 slash commands.
 
 ---
 

@@ -522,7 +522,7 @@ injecting both into the system prompt. `/init` generates a starter file.
 ## Architecture
 
 ```
-main()  ── CLI loop, 43 slash commands
+main()  ── CLI loop, 45 slash commands
   │
   └── Agent.chat()
         ├── MoodState.begin_turn()        emotional state entering the turn
