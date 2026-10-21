@@ -6,7 +6,7 @@
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Dependencies](https://img.shields.io/badge/dependencies-1-brightgreen)
-![Single file](https://img.shields.io/badge/single--file-5.9k%20lines-orange)
+![Single file](https://img.shields.io/badge/single--file-6.6k%20lines-orange)
 ![Version](https://img.shields.io/badge/version-1.1.6-lightgrey)
 
 An open-source autonomous AI agent with a persistent personality, long-term
@@ -50,8 +50,9 @@ python polaris_1_1_6_memorycurve.py --selftest    # exits non-zero if anything f
 
 or `/selftest` from inside a session.
 
-Twenty-nine checks covering the sandbox, the shell guard, file-edit safety,
-context assembly, the trace tree, and the memory curve. No API key required.
+Thirty-four checks covering the sandbox, the shell guard, file-edit safety,
+context assembly, the trace tree, the memory curve, and the terminal UI. No API
+key required.
 
 **Requirements:** Python 3.10+, and an OpenAI-compatible endpoint.
 Works on Windows, Linux, and macOS. The only dependency is `openai` — every
@@ -94,9 +95,17 @@ prompt on every turn — and all three persist across sessions.
 Every turn writes a structured execution trace you can actually read:
 `/trace` for the timeline, `/trace json` for the whole tree.
 
+### A terminal that shows it working
+
+While it waits — on the model, on a tool — a spinner shows that it is busy, for
+how long, and that Ctrl+C stops the turn without ending the session. Answers
+stream in as rendered Markdown instead of raw `**` and `##`, and its thinking is
+set apart in dim italics. Plain ANSI codes, no UI library; piped output stays
+plain text.
+
 ### One file, one dependency
 
-5,900 lines of Python, no framework, no vector database, no build step. Copy it
+6,600 lines of Python, no framework, no vector database, no build step. Copy it
 anywhere and run it.
 
 ---
@@ -119,7 +128,7 @@ anywhere and run it.
 | **MCP + Plugins** | Model Context Protocol over stdio; drop-in `plugins/*.py` |
 | **Safety** | Python sandbox, shell guard, file checkpoints, permission modes |
 
-35 built-in tools. 45 slash commands.
+35 built-in tools. 46 slash commands.
 
 ---
 

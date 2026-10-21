@@ -165,15 +165,18 @@ file edit.
 
 ### Self-tests
 
-`/selftest` runs a twenty-nine-check suite covering JSON parsing, context building,
+`/selftest` runs a thirty-four-check suite covering JSON parsing, context building,
 snapshot round-trip, calculator sandbox escapes, shell guard rules, context
 starvation, step-budget direction, trace wiring, sub-agent isolation, tool
 description coverage, and three memory checks — curve direction and the spacing
 effect, vector recall with cross-process determinism, and forgetting behaviour
 (dormancy without deletion, cued recall, legacy migration), the MCP permission
 gate, the embedding timeout, file paging, shell exit-code reporting, streaming
-tool-call assembly, whether the chain of thought is actually causal, and the
-file-editing safety rules. No API key required.
+tool-call assembly, whether the chain of thought is actually causal, the
+file-editing safety rules, and the terminal UI — Markdown rendering, live redraw
+matching the line-by-line layout exactly, the spinner leaving no trace, thinking
+kept apart from the answer, and `exit` / Ctrl+C / the startup gate. No API key
+required.
 
 It runs in CI too. `python polaris_1_1_6_memorycurve.py --selftest` exits non-zero
 if any check fails, and GitHub Actions runs it on every push across Python
@@ -362,6 +365,56 @@ behaviour.
 
 ---
 
+## Terminal UI
+
+The conversation used to be raw text: `**bold**` and `## headings` printed as
+typed, the model's thinking in the same colour as its answer — and when a model
+thought and answered in one step, the answer was glued onto the end of the
+thinking line. While the model was working, the screen showed nothing at all.
+
+Now each turn is laid out as a column of blocks, one blank line apart:
+
+```
+你 › 看看这个项目里有什么
+
+✳ 思考
+  用户想了解这个项目。先读 README，再找一下入口。      ← dim italic
+
+● read_file("README.md", limit=30)
+  ⎿ README.md 第 1-30 行 / 共 237 行  … +31 行
+
+✦ 这个项目叫 Polaris，是一个单文件的 AI 智能体。     ← rendered Markdown
+```
+
+- **A spinner while it waits** — on the model, on a tool, on the self-check. A
+  breathing star, a shimmer across the label, the time spent on this turn, and a
+  reminder that Ctrl+C stops it. Short waits draw nothing, so quick tools do not
+  flicker.
+- **Markdown, rendered as it streams.** Headings, bold, italic, inline code,
+  lists, quotes and code blocks. Lines wrap at word boundaries with hanging
+  indents. A line still being written is re-laid-out on every chunk, so markers
+  like `**` never show up on screen even halfway through.
+- **Ctrl+C stops the turn, not the program.** Any tool call left without a
+  result is closed off in the history, so the next request does not fail.
+- **The input line has history and editing** (↑, ←, →) where `readline` exists.
+- **`exit` works without the slash**, as `/help` always said it did.
+
+It is still plain ANSI escape codes and the standard library — no UI framework.
+Piped or redirected output gets no animation and no formatting, just the text.
+`POLARIS_ANIMATE=0` keeps the formatting but never moves the cursor.
+
+The `stream_view_layout` self-check holds the redraw logic to account: it feeds
+the same stream through the animated path and the line-by-line path, replays
+both through a minimal terminal emulator, and requires the final screens to be
+identical. Miscount the rows of one redraw and the check fails.
+
+The startup gate — a model call at launch that decides whether Polaris should
+start at all, and can refuse — is now **off by default**. It cost a call and a
+few seconds on every launch to second-guess someone who had just typed the
+command. `POLARIS_STARTUP_GATE=1` brings it back.
+
+---
+
 ## Quick start
 
 ```bash
@@ -463,7 +516,8 @@ Every file write is checkpointed first — `/undo` restores the previous version
 | `OPENAI_BASE_URL` | — | Custom endpoint. |
 | `MINIAGENT_BACKEND` | `openai_compatible` | `openai` · `ollama` · `lmstudio` · `local` |
 | `MINIAGENT_MODEL` | `gpt-4o` | Model for gate, main agent, and sub-agents alike. |
-| `MINIAGENT_SKIP_GATE` | `false` | Skip the startup readiness check. |
+| `POLARIS_STARTUP_GATE` | `false` | Ask the model at launch whether it is worth starting; it can refuse. Off by default — it costs a call and a few seconds on every launch. |
+| `MINIAGENT_SKIP_GATE` | `false` | Legacy. Skips the gate when `POLARIS_STARTUP_GATE` is on. |
 | `MINIAGENT_SHOW_THOUGHT` | `true` | Print the inner monologue. |
 | `MINIAGENT_THOUGHT_STYLE` | `balanced` | Thinking style. |
 | `POLARIS_MONOLOGUE_MODE` | `cot` | `cot` (real chain of thought) · `template` (offline flavour, no API call) · `llm` / `hybrid` (legacy: a separate call whose output never reaches the answer) |
@@ -474,6 +528,7 @@ Every file write is checkpointed first — `/undo` restores the previous version
 | `POLARIS_CONTEXT_POSITION` | `tail` | Where volatile runtime state goes. `tail` keeps the cache prefix stable; `system` is the pre-1.1.6 layout. |
 | `POLARIS_MAX_CONTEXT_TOKENS` | `32000` | Token budget for the conversation history. Lower it for small local models. |
 | `POLARIS_COLOR` | auto | `1`/`0` to force colour on or off. Off automatically when not a TTY. `NO_COLOR` is honoured. |
+| `POLARIS_ANIMATE` | `true` | Spinner and live Markdown redraw. `0` keeps the formatting but never moves the cursor. Off automatically when not a TTY. |
 | `POLARIS_SHELL_ALLOW_DANGEROUS` | `false` | Lift the destructive-command block. |
 | `MINIAGENT_PLUGIN_DIRS` | `plugins` | Comma-separated plugin directories. |
 | `POLARIS_EMBED_BACKEND` | `auto` | `auto` · `remote` · `local`. `auto` uses the remote model when an endpoint is configured, else the local hash embedder. |
@@ -522,7 +577,7 @@ injecting both into the system prompt. `/init` generates a starter file.
 ## Architecture
 
 ```
-main()  ── CLI loop, 45 slash commands
+main()  ── CLI loop, 46 slash commands
   │
   └── Agent.chat()
         ├── MoodState.begin_turn()        emotional state entering the turn

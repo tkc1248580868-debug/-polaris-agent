@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 import ast
+import atexit
 import hashlib
 import datetime
 import importlib.util
@@ -11,6 +12,7 @@ import json
 import math
 import operator
 import os
+import random
 import re
 import shlex
 import shutil
@@ -30,6 +32,7 @@ from enum import Enum
 from pathlib import Path
 from time import time
 from typing import Any, Callable, get_type_hints
+from urllib.parse import urlparse
 try:
     from openai import OpenAI
 except ImportError:
@@ -50,8 +53,10 @@ def _env_bool(name: str, default: bool = False) -> bool:
 # 为了好看牺牲掉它不划算。纯 ANSI 转义码够用，连 import 都省了。
 # ───────────────────────────────────────────────────────────────────────────────
 _STYLES = {
-    "reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m", "italic": "\033[3m",
+    "reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m", "italic": "\033[3m", "underline": "\033[4m",
     "accent": "\033[38;5;111m",   # Polaris 的主色，一整套界面只用这一个彩色
+    # 主色的两档浅色，只给等待动画里那道扫过文字的光用——还是同一个蓝，不算新颜色
+    "glow": "\033[38;5;153m", "shine": "\033[38;5;189m",
     "green": "\033[32m", "yellow": "\033[33m", "red": "\033[31m", "gray": "\033[90m",
 }
 def _color_enabled() -> bool:
@@ -98,6 +103,502 @@ def _fit_display(text: str, width: int) -> str:
             break
         out += ch
     return out + "…"
+# ───────────────────────────────────────────────────────────────────────────────
+# 终端呈现：等待动画、Markdown 排版、一回合的版面
+#
+# 等模型的时候屏幕不能是死的：一颗会呼吸的星、一道扫过文字的光、一个秒表，
+# 让人一眼看出它在干活、干了多久、怎么打断——这套是跟 Claude Code 学的。
+# 回答按 Markdown 排好再上屏，不把 ** 和 ## 原样甩给用户。
+#
+# 依旧只靠标准库和 ANSI 转义码。不是终端（管道、重定向、CI）时动画和排版全关、
+# 原样输出：日志里要的是能 grep 的原文，不是一堆光标控制码。
+# ───────────────────────────────────────────────────────────────────────────────
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+def _is_tty() -> bool:
+    try:
+        return bool(sys.stdout.isatty()) and os.environ.get("TERM", "") != "dumb"
+    except Exception:
+        return False
+_TTY = _is_tty()
+# 动画要靠「把光标挪回去重画」实现。POLARIS_ANIMATE=0 只保留排版，不动光标。
+_ANIMATE = _TTY and _env_bool("POLARIS_ANIMATE", True)
+if _ANIMATE:
+    # 动画期间会藏起光标。万一进程从奇怪的地方退出，至少把光标还回去。
+    atexit.register(lambda: (sys.stdout.write("\x1b[?25h"), sys.stdout.flush()))
+def _visible_width(text: str) -> int:
+    """去掉转义码之后的显示宽度。"""
+    return _display_width(_ANSI_RE.sub("", text))
+def _term_width() -> int:
+    """排版宽度：跟着终端走，但超过 100 列就不再变宽，太长的行读着累。
+    最后一列空着不用：写满整行时各家终端的折行行为不一致，擦除重画会算错行数。"""
+    cols = shutil.get_terminal_size((80, 24)).columns
+    return max(20, min(cols, 101) - 1)
+class Spinner:
+    """等待动画：呼吸的星 + 扫过文字的光 + 本回合已用时。
+
+    跑在后台线程里，只管自己那一行，每一帧回到行首重画。
+    往屏幕写任何东西之前都必须先 stop()——它会把这一行擦干净，动画不在输出里留痕迹。
+    等待很短（读个小文件）时一帧都不画，免得一闪一闪。
+
+    gap=True 时动画和上面的内容隔一个空行（画在下一行），停下时退回原来那一行：
+    光标回到哪儿，后面的输出就从哪儿接着写，版面和没转过一样。"""
+    FRAMES = "·✢✳✶✻✽✻✶✳✢"
+    VERBS = ("思索", "琢磨", "推敲", "斟酌", "观星", "校准航向", "整理思路", "翻阅记忆")
+    INTERVAL = 0.08
+    DELAY = 0.15
+    def __init__(self, label: str = "", *, since: float | None = None, enabled: bool | None = None,
+                 gap: bool = False):
+        self.label = label or random.choice(self.VERBS)
+        self.since = since
+        self.gap = gap
+        self.enabled = _ANIMATE if enabled is None else enabled
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._drawn = False
+        self._out: Any = None
+    @property
+    def running(self) -> bool:
+        return self._thread is not None
+    def frame(self, tick: int, elapsed: float) -> str:
+        star = paint(self.FRAMES[tick % len(self.FRAMES)], "accent")
+        text = self.label + "…"
+        # 光从左边外面扫进来、从右边扫出去，然后从头再来；正中最亮，两侧渐暗
+        center = tick % (len(text) + 6) - 3
+        lit = []
+        for i, ch in enumerate(text):
+            near = abs(i - center)
+            lit.append(paint(ch, "shine", "bold") if near == 0 else paint(ch, "glow") if near == 1 else paint(ch, "accent"))
+        hint = paint(f"（{int(elapsed)}s · Ctrl+C 打断）", "dim")
+        return f"{star} {''.join(lit)} {hint}"
+    def start(self) -> "Spinner":
+        if not self.enabled or self._thread is not None:
+            return self
+        self._out = sys.stdout
+        self._stop.clear()
+        self._drawn = False
+        self.since = self.since or time()
+        self._thread = threading.Thread(target=self._run, name="polaris-spinner", daemon=True)
+        self._thread.start()
+        return self
+    def _run(self) -> None:
+        if self._stop.wait(self.DELAY):
+            return
+        tick = 0
+        while True:
+            try:
+                # 藏光标：不然它会在动画后面跟着闪
+                lead = "\n" if self.gap and not self._drawn else ""
+                self._out.write(lead + "\x1b[?25l\r" + self.frame(tick, time() - self.since) + "\x1b[K")
+                self._out.flush()
+                self._drawn = True
+            except Exception:
+                return
+            if self._stop.wait(self.INTERVAL):
+                return
+            tick += 1
+    def stop(self) -> None:
+        if self._thread is None:
+            return
+        self._stop.set()
+        self._thread.join()
+        self._thread = None
+        if self._drawn:
+            try:
+                self._out.write("\r\x1b[K" + ("\x1b[1A" if self.gap else "") + "\x1b[?25h")
+                self._out.flush()
+            except Exception:
+                pass
+    def __enter__(self) -> "Spinner":
+        return self.start()
+    def __exit__(self, *exc: Any) -> None:
+        self.stop()
+_MD_INLINE = re.compile(
+    r"(`+)(.+?)\1"                                          # `代码`
+    r"|\*\*(?=\S)(.+?)(?<=\S)\*\*"                          # **加粗**
+    # *斜体*。两边只排除英文字母数字（防 2*3*4 这种）——不能用 \w，
+    # Python 里中文也算 \w，那样「会*成长*的」就永远认不出来了
+    r"|(?<![A-Za-z0-9*])\*(?=[^\s*])([^*]+?)(?<=\S)\*(?![A-Za-z0-9*])"
+    r"|\[([^\]]+)\]\(([^)\s]+)\)"                           # [链接](url)
+)
+def _md_inline(text: str, base: tuple[str, ...] = ()) -> list[tuple[str, tuple[str, ...]]]:
+    """行内 Markdown → (文字, 样式) 片段。只认最常见的四种：代码、加粗、斜体、链接。
+
+    下划线写法（__x__、_x_）故意不认：回答里到处是 __init__ 和 snake_case，
+    认了误伤的远比漏掉的多。"""
+    segs: list[tuple[str, tuple[str, ...]]] = []
+    pos = 0
+    for m in _MD_INLINE.finditer(text):
+        if m.start() > pos:
+            segs.append((text[pos:m.start()], base))
+        if m.group(1):
+            segs.append((m.group(2), base + ("accent",)))
+        elif m.group(3) is not None:
+            segs.extend(_md_inline(m.group(3), base + ("bold",)))
+        elif m.group(4) is not None:
+            segs.append((m.group(4), base + ("italic",)))
+        else:
+            label, url = m.group(5), m.group(6)
+            segs.append((label, base + ("underline",)))
+            if url != label:
+                segs.append((f" ({url})", base + ("dim",)))
+        pos = m.end()
+    if pos < len(text):
+        segs.append((text[pos:], base))
+    return segs
+def _paint_segments(segs: list[tuple[str, tuple[str, ...]]]) -> str:
+    """把样式片段拼成带转义码的字符串；相邻同样式的合并，少发几个转义码。"""
+    out, run, style = [], "", None
+    for text, st in segs:
+        if st == style:
+            run += text
+            continue
+        if run:
+            out.append(paint(run, *style))
+        run, style = text, st
+    if run:
+        out.append(paint(run, *(style or ())))
+    return "".join(out)
+def _wrap_segments(segs: list[tuple[str, tuple[str, ...]]], width: int,
+                   first_prefix: str = "", rest_prefix: str = "", keep_indent: bool = False) -> list[str]:
+    """按显示宽度折行，样式跟着字走。英文按词折、中文按字折，续行用 rest_prefix 悬挂缩进。
+
+    自己折而不交给终端有两个原因：终端折出来的续行会顶到第 0 列，缩进全没了；
+    而且流式预览要擦掉重画，必须确切知道一行占了几排——每一排都不超过 width，
+    终端就不会自己再折，排数才算得准。keep_indent 保留第一排开头的空格（代码缩进）。"""
+    units: list[tuple[str, tuple[str, ...]]] = []
+    for text, st in segs:
+        word = ""
+        for ch in text.replace("\t", "    "):
+            if ch.isspace() or _display_width(ch) != 1:
+                if word:
+                    units.append((word, st))
+                    word = ""
+                units.append((" " if ch.isspace() else ch, st))
+            else:
+                word += ch
+        if word:
+            units.append((word, st))
+    rows: list[str] = []
+    cur: list[tuple[str, tuple[str, ...]]] = []
+    prefix, col = first_prefix, 0
+    avail = max(1, width - _visible_width(prefix))
+    def newline() -> None:
+        nonlocal cur, col, prefix, avail
+        while cur and cur[-1][0] == " ":
+            cur.pop()
+        rows.append(prefix + _paint_segments(cur))
+        cur, col, prefix = [], 0, rest_prefix
+        avail = max(1, width - _visible_width(prefix))
+    for text, st in units:
+        w = _display_width(text)
+        if text == " ":
+            if col == 0 and not (keep_indent and not rows):
+                continue  # 折行后的行首不留空格
+            if col + 1 > avail:
+                newline()
+                continue
+            cur.append((text, st))
+            col += 1
+            continue
+        if col and col + w > avail:
+            newline()
+        while w > avail:  # 一个词比整行还宽（长网址、长路径）：只能硬切
+            head, hw = "", 0
+            for ch in text:
+                cw = _display_width(ch)
+                if hw + cw > avail:
+                    break
+                head, hw = head + ch, hw + cw
+            head = head or text[0]
+            cur.append((head, st))
+            newline()
+            text = text[len(head):]
+            w = _display_width(text)
+        if text:
+            cur.append((text, st))
+            col += w
+    if cur or not rows:
+        newline()
+    return rows
+class MarkdownRenderer:
+    """逐行把 Markdown 排成终端文本。
+
+    流式输出时一行收全了才排这一行，所以跨行只需要记一个状态：是不是在代码块里。
+    表格之类排不好的写法原样输出，不瞎猜。"""
+    _FENCE = re.compile(r"^\s*(```|~~~)")
+    _HEADING = re.compile(r"^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$")
+    _RULE = re.compile(r"^\s{0,3}([-*_])(\s*\1){2,}\s*$")
+    _BULLET = re.compile(r"^(\s*)[-*+]\s+(.*)$")
+    _ORDERED = re.compile(r"^(\s*)(\d{1,3}[.)])\s+(.*)$")
+    _QUOTE = re.compile(r"^\s{0,3}>\s?(.*)$")
+    _TASK = re.compile(r"^\[([ xX])\]\s+(.*)$")
+    def __init__(self, width: int, *, preview: bool = False):
+        self.width = width
+        self.in_code = False
+        # 预览排的是还没写完的半行：**加 这种开了头还没收尾的记号先藏起来，
+        # 等收尾的那半来了再变粗。定稿时照原文排，不会误删正文里真有的星号。
+        self.preview = preview
+    def _inline(self, text: str, base: tuple[str, ...] = ()) -> list[tuple[str, tuple[str, ...]]]:
+        segs = _md_inline(text, base)
+        if not self.preview:
+            return segs
+        # 只清没被任何记号认领的原文片段（样式就是 base 的那些）；代码片段里的星号原样留着
+        return [(t.replace("**", "").replace("`", "") if st == base else t, st) for t, st in segs]
+    def render(self, line: str, first: str = "", rest: str = "") -> list[str]:
+        """排一行。first 是这一行头一排的前缀（回答的第一行是 ✦），rest 是折行后的前缀。
+        返回空列表表示这一行不上屏（代码块的围栏）。"""
+        if self._FENCE.match(line):
+            self.in_code = not self.in_code
+            return []
+        if self.in_code:
+            bar = paint("│ ", "dim")
+            return _wrap_segments([(line, ("accent",))], self.width, first + bar, rest + bar, keep_indent=True)
+        if not line.strip():
+            return [""]
+        m = self._HEADING.match(line)
+        if m:
+            base = ("bold", "accent") if len(m.group(1)) <= 2 else ("bold",)
+            return _wrap_segments(self._inline(m.group(2), base), self.width, first, rest)
+        if self._RULE.match(line):
+            return [first + paint("─" * max(3, min(40, self.width - _visible_width(first))), "dim")]
+        m = self._BULLET.match(line)
+        if m:
+            pad = " " * len(m.group(1).expandtabs(4))
+            body, mark = m.group(2), "•"
+            task = self._TASK.match(body)
+            if task:
+                mark, body = ("✔" if task.group(1) != " " else "○"), task.group(2)
+            return _wrap_segments(self._inline(body), self.width,
+                                  first + pad + paint(mark, "accent") + " ", rest + pad + "  ")
+        m = self._ORDERED.match(line)
+        if m:
+            pad = " " * len(m.group(1).expandtabs(4))
+            return _wrap_segments(self._inline(m.group(3)), self.width,
+                                  first + pad + paint(m.group(2), "accent") + " ",
+                                  rest + pad + " " * (len(m.group(2)) + 1))
+        m = self._QUOTE.match(line)
+        if m:
+            bar = paint("│ ", "dim")
+            return _wrap_segments(self._inline(m.group(1), ("italic",)), self.width, first + bar, rest + bar)
+        if line.lstrip().startswith("|"):
+            cells = line.strip()
+            if re.fullmatch(r"[|:\-\s]+", cells):
+                return _wrap_segments([(cells.replace("-", "─"), ("dim",))], self.width, first, rest)
+            return _wrap_segments([(part, ("dim",)) if part == "|" else (part, ())
+                                   for part in re.split(r"(\|)", cells) if part], self.width, first, rest)
+        pad = " " * (len(line) - len(line.lstrip(" ")))
+        return _wrap_segments(self._inline(line.strip()), self.width, first + pad, rest + pad)
+def _format_tool_args(args_str: str) -> str:
+    """工具参数的短写法：read_file("README.md", limit=30)，而不是一整坨 JSON。"""
+    try:
+        args = json.loads(args_str) if args_str.strip() else {}
+    except Exception:
+        return args_str
+    if not isinstance(args, dict):
+        return args_str
+    parts = []
+    for i, (key, value) in enumerate(args.items()):
+        shown = json.dumps(value, ensure_ascii=False)
+        parts.append(shown if i == 0 else f"{key}={shown}")
+    return ", ".join(parts)
+def _summarize_tool_output(output: str) -> tuple[str, int]:
+    """工具结果在屏幕上只露第一行，再告诉人后面还有几行——完整内容在 /trace 和模型那里。"""
+    text = (output or "").replace(os.getcwd() + os.sep, "")
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        return "（无输出）", 0
+    return lines[0].replace("\t", " ").strip(), len(lines) - 1
+class StreamView:
+    """一回合的屏幕版面：思考、回答、工具调用排成一列，块与块之间空一行。
+
+    回答逐行排版。一行还没收到换行时，每来一段字就把这半行重新排一遍、擦掉旧的画上新的，
+    所以字是一个个流出来的，而 ** 这类记号从头到尾不会在屏幕上露面；
+    这一行收全了就定稿，不再动它。
+
+    按环境自动选三种工作方式：
+    - 终端 + 动画：半行预览 + 擦除重画，外加等待动画；
+    - 终端但 POLARIS_ANIMATE=0：一行收全了再排好输出，不动光标；
+    - 不是终端（或子代理）：原样直出，不排版、不加转义码。"""
+    def __init__(self, tag: str = "", *, render: bool | None = None, animate: bool | None = None,
+                 width: int | None = None, out: Any = None):
+        self.tag = tag if not tag or tag.endswith(" ") else tag + " "
+        self.render = (_TTY and not tag) if render is None else render
+        self.animate = (_ANIMATE and not tag) if animate is None else animate
+        self.live = self.animate and self.render
+        self._width = width
+        self._out = out
+        self.spinner: Spinner | None = None
+        self.verb = random.choice(Spinner.VERBS)
+        self.turn_started = time()
+        self.block: str | None = None
+        self._reset_block()
+    def _reset_block(self) -> None:
+        self.buf = ""            # 当前行已经收到、还没等到换行的部分
+        self.previewing = False  # 屏幕上是不是挂着这半行的预览
+        self.rows = 0            # 预览往下折了几排（擦的时候往上退几排）
+        self.lines_out = 0       # 这一块已经上屏几行（第一行才带 ✦）
+        self.blank_pending = 0   # 攒着的空行：后面还有正文才补出来，块尾的直接丢
+        self.md: MarkdownRenderer | None = None
+    @property
+    def out(self) -> Any:
+        return self._out or sys.stdout
+    @property
+    def width(self) -> int:
+        return self._width or _term_width()
+    def _write(self, text: str) -> None:
+        self.out.write(text)
+        self.out.flush()
+    # ── 等待动画 ──
+    def begin_turn(self) -> None:
+        self.verb = random.choice(Spinner.VERBS)
+        self.turn_started = time()
+    def wait(self, label: str = "") -> None:
+        """开始等（模型还没吐字、工具还在跑）。已经在转就不重开。"""
+        if self.spinner is not None and self.spinner.running:
+            return
+        self.close()
+        self.spinner = Spinner(label or self.verb, since=self.turn_started, enabled=self.animate, gap=True).start()
+    def stop_wait(self) -> None:
+        if self.spinner is not None:
+            self.spinner.stop()
+    # ── 思考与回答 ──
+    def _open(self, kind: str) -> None:
+        self.stop_wait()
+        if self.block == kind:
+            return
+        self.close()
+        self.block = kind
+        self._reset_block()
+        if kind == "thinking":
+            self._write(f"\n{self.tag}{paint('✳ 思考', 'accent')}\n")
+        else:
+            self._write("\n")
+            self.md = MarkdownRenderer(self.width) if self.render else None
+    def _prefixes(self) -> tuple[str, str]:
+        if self.block == "thinking":
+            return self.tag + "  ", self.tag + "  "
+        if not self.render:
+            return self.tag, self.tag
+        first = paint("✦", "accent") + " " if self.lines_out == 0 else "  "
+        return self.tag + first, self.tag + "  "
+    def thinking(self, piece: str) -> None:
+        if piece:
+            self._open("thinking")
+            self._feed(piece)
+    def answer(self, piece: str) -> None:
+        if self.block != "answer":
+            piece = piece.lstrip("\n")  # 回答开头的空行没有意义
+        if piece:
+            self._open("answer")
+            self._feed(piece)
+    def _feed(self, piece: str) -> None:
+        for i, part in enumerate(piece.split("\n")):
+            if i:
+                self._commit()
+            if part:
+                self._preview(part)
+    def _flush_blanks(self) -> None:
+        if self.blank_pending and self.lines_out:
+            self._write("\n")  # 连续多个空行只留一个
+        self.blank_pending = 0
+    def _render_line(self, line: str, *, preview: bool) -> list[str]:
+        first, rest = self._prefixes()
+        if self.block == "thinking":
+            return _wrap_segments([(line.strip(), ("dim", "italic"))], self.width, first, rest) if line.strip() else []
+        if self.md is None:
+            return [first + line]
+        md = self.md
+        if preview:
+            # 预览排的是半行，不能动真正的渲染器状态：半行 ``` 也会把代码块开关拨一下
+            md = MarkdownRenderer(self.width, preview=True)
+            md.in_code = self.md.in_code
+        return md.render(line, first, rest)
+    def _erase_seq(self) -> str:
+        if not self.previewing:
+            return ""
+        seq = (f"\x1b[{self.rows}A" if self.rows else "") + "\r\x1b[J"
+        self.previewing, self.rows = False, 0
+        return seq
+    def _preview(self, text: str) -> None:
+        starting = not self.buf
+        self.buf += text
+        if not self.render:
+            if starting:
+                self._flush_blanks()
+                self._write(self._prefixes()[0])
+            self._write(paint(text, *(("dim", "italic") if self.block == "thinking" else ())))
+            return
+        if not self.live:
+            return
+        # 只有空格的半行先不画：它多半是个空行，画出来再擦会多留一个空行
+        in_code = self.md is not None and self.md.in_code
+        rows = self._render_line(self.buf, preview=True) if (self.buf.strip() or in_code) else []
+        seq = self._erase_seq()
+        if rows:
+            if self.blank_pending and self.lines_out:
+                seq += "\n"
+            self.blank_pending = 0 if self.lines_out else self.blank_pending
+            # 擦旧的、画新的放在同一次 write 里，终端一次画完，不会闪
+            seq += "\n".join(rows)
+            self.previewing, self.rows = True, len(rows) - 1
+        self._write(seq)
+    def _commit(self) -> None:
+        line, self.buf = self.buf, ""
+        if not self.render:
+            if line:
+                self._write("\n")
+                self.lines_out += 1
+            else:
+                self.blank_pending += 1
+            return
+        seq = self._erase_seq()
+        in_code = self.md is not None and self.md.in_code
+        if not line.strip() and not in_code:
+            self._write(seq)
+            self.blank_pending += 1
+            return
+        rows = self._render_line(line, preview=False)
+        if rows:
+            if self.blank_pending and self.lines_out:
+                seq += "\n"  # 连续多个空行只留一个
+            self.blank_pending = 0
+            seq += "".join(row + "\n" for row in rows)
+            self.lines_out += 1
+        self._write(seq)
+    def _erase_preview(self) -> None:
+        self._write(self._erase_seq())
+    def close(self) -> None:
+        """结束当前这一块：没收到换行的半行也排出来。"""
+        if self.block is None:
+            return
+        if self.buf:
+            self._commit()
+        self._erase_preview()
+        self.block = None
+        self._reset_block()
+    # ── 工具与提示 ──
+    def tool_call(self, name: str, args_str: str) -> None:
+        self.stop_wait()
+        self.close()
+        room = self.width - _display_width(self.tag) - _display_width(name) - 4
+        args = _fit_display(_format_tool_args(args_str), max(8, room))
+        self._write(f"\n{self.tag}" + paint("●", "accent") + " " + paint(name, "bold") + paint(f"({args})", "dim") + "\n")
+    def tool_result(self, output: str, ok: bool) -> None:
+        self.stop_wait()
+        head, more = _summarize_tool_output(output)
+        tail = f"  … +{more} 行" if more else ""
+        room = self.width - _display_width(self.tag) - 4 - _display_width(tail)
+        mark = paint("⎿", "gray" if ok else "red")
+        self._write(f"{self.tag}  {mark} " + paint(_fit_display(head, max(8, room)), "dim" if ok else "red")
+                    + paint(tail, "dim") + "\n")
+    def notice(self, text: str, *styles: str) -> None:
+        self.stop_wait()
+        self.close()
+        self._write(f"\n{self.tag}{paint(text, *styles)}\n")
+    def end(self) -> None:
+        """回合结束（包括被打断、出异常）：停动画，把没写完的收尾。"""
+        self.stop_wait()
+        self.close()
 def _as_str_list(value: Any) -> list[str]:
     """把模型传来的「一组字符串」参数规范化。
 
@@ -352,6 +853,9 @@ BACKEND_NAME = os.environ.get("MINIAGENT_BACKEND", "openai_compatible").strip().
 MODEL = os.environ.get("MINIAGENT_MODEL", "gpt-4o")
 MAIN_MODEL = MODEL
 GATE_MODEL = MODEL
+# 启动门禁：开机先问模型「现在有没有必要上线」，它可以拒绝启动。默认关——
+# 用户已经敲了命令，就是要用它；每次启动多花一次调用、多等几秒，还可能被拒，不值。
+STARTUP_GATE = _env_bool("POLARIS_STARTUP_GATE", False)
 MEMORY_FILE = os.environ.get("MINIAGENT_MEMORY_FILE", "agent_memory.json")
 MEMORY_VECTOR_FILE = os.environ.get("MINIAGENT_MEMORY_VECTOR_FILE", "agent_memory_vectors.json")
 # 向量记忆：auto = 有远程嵌入就用，没有就退回本地哈希向量；local 强制离线；remote 强制远程。
@@ -2162,16 +2666,21 @@ class ThinkingSplitter:
             if tag.startswith(buf[-size:]):
                 return size
         return 0
-    def finish(self) -> None:
-        """流结束：还没判定的残留一律算正文。"""
+    def finish(self) -> tuple[str, str]:
+        """流结束：还没判定的残留一律算正文。返回这次补出来的 (思考片段, 答案片段)，
+        调用方要把它们也显示出来——不然回答最后几个字会只进历史、不上屏。"""
+        think_out, answer_out = "", ""
         if self._pending:
             if self._state == "thinking":
+                think_out = self._pending
                 self.thinking += self._pending
             else:
+                answer_out = self._pending
                 self.answer += self._pending
             self._pending = ""
         if self._state == "unknown":
             self._state = "answer"
+        return think_out, answer_out
     @classmethod
     def split(cls, text: str) -> tuple[str, str]:
         """一次性拆分（非流式路径用）。"""
@@ -4123,6 +4632,34 @@ class Agent:
             while trimmed and trimmed[0].get("role") == "tool":
                 trimmed.pop(0)
         self.messages = list(trimmed)
+    def _view(self) -> StreamView:
+        """这个代理的屏幕版面。懒创建：自检里的探针是 Agent.__new__ 出来的，不走 __init__。"""
+        view = self.__dict__.get("_stream_view")
+        if view is None:
+            view = StreamView(getattr(self, "tag", ""))
+            self._stream_view = view
+        return view
+    def interrupt(self) -> None:
+        """回合被 Ctrl+C 打断（或出异常）之后收拾现场。
+
+        打断可能正好落在「模型要调工具、工具结果还没回来」的半截上。这种半截消息
+        留在历史里，下一次请求会被 API 直接 400，整个会话就卡死了。
+        所以给没等到结果的调用补一条「被打断」的结果，再补一句助手的话把这一轮收住。"""
+        self._view().end()
+        answered = {m.get("tool_call_id") for m in self.messages if m.get("role") == "tool"}
+        for msg in reversed(self.messages):
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                for tc in msg["tool_calls"]:
+                    if tc.get("id") not in answered:
+                        self.messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.get("id"),
+                            "name": tc.get("function", {}).get("name", ""),
+                            "content": "（用户打断了这次调用，它没有执行完。）",
+                        })
+                break
+        if self.messages and self.messages[-1].get("role") in {"user", "tool"}:
+            self.messages.append({"role": "assistant", "content": "（这一轮被用户打断了，没有说完。）"})
     def recent_transcript(self, limit: int = 4) -> str:
         tail = self.messages[-limit:]
         lines: list[str] = []
@@ -4174,6 +4711,7 @@ class Agent:
             recent_context=self.recent_transcript(2),
         )
         header = f"{self.tag}✦ Inner Voice | {label}" if self.tag else f"✦ Inner Voice | {label}"
+        self._view().end()
         print(f"\n{header}")
         for line in lines[:12]:
             if line.strip():
@@ -4248,6 +4786,8 @@ class Agent:
         if self.trace_enabled:
             # 每个新回合开一棵新的轨迹树；子代理不清空，避免抹掉主代理的轨迹。
             TRACE_ENGINE.clear()
+        view = self._view()
+        view.begin_turn()
         try:
             MOOD.begin_turn(user_input)
             if self.archive_enabled:
@@ -4265,7 +4805,7 @@ class Agent:
                     verdict = self._self_reflect()
                     if verdict and not verdict.get("passed", True):
                         issues = verdict.get("issues", "不完整")
-                        print(f"{self.tag}  [反思] 自检不通过：{issues}，尝试自愈...")
+                        view.notice(f"↻ 自检没通过：{issues}。再改一轮。", "yellow")
                         self._trace_event("自检不通过，进入自愈", TraceLevel.WARNING, detail=str(issues)[:120])
                         self.messages.append({"role": "user", "content": f"（系统反思自动提示：{issues}。请进行修正。）"})
                         self._trim_messages()
@@ -4273,7 +4813,7 @@ class Agent:
                             final_text, _ = self._run_loop()
                     elif verdict and verdict.get("lesson"):
                         mid = MEMORY.add(str(verdict["lesson"]), "lesson")
-                        print(f"{self.tag}  [记忆] 沉淀教训 #{mid}：{verdict['lesson']}")
+                        view.notice(f"✎ 记下一条教训 #{mid}：{verdict['lesson']}", "dim")
                         self._trace_event(f"沉淀教训 #{mid}", TraceLevel.INFO, detail=str(verdict["lesson"])[:120])
             if self.archive_enabled:
                 ARCHIVE.append("assistant", final_text, kind="turn")
@@ -4282,6 +4822,7 @@ class Agent:
                 RELATIONSHIP.observe_turn(user_input, final_text, used_tools=used_tools)
             return final_text
         finally:
+            view.end()
             self._current_user_input = ""
     def _run_loop(self) -> tuple[str, bool]:
         final_text, used_tools = "", False
@@ -4296,24 +4837,15 @@ class Agent:
                 used_tools = True
                 self._run_tools_and_feed_back(msg)
         else:
-            print(f"\n{self.tag}[!] 达到最大步数上限。")
+            self._view().notice(f"[!] 达到最大步数上限（{loop_cap} 步）。", "yellow")
             self._trace_event(f"达到步数上限 {loop_cap}", TraceLevel.WARNING)
         return final_text, used_tools
     def _print_thinking(self, piece: str) -> None:
-        """把思考流打到「思考」通道，和正式回答在视觉上分开。"""
-        if self.quiet or not piece:
-            return
-        if not self._thinking_open:
-            header = paint("✳ 思考", "accent")
-            print(f"\n{self.tag}{header}\n{self.tag}  ", end="", flush=True)
-            self._thinking_open = True
-        print(piece.replace("\n", f"\n{self.tag}  "), end="", flush=True)
+        """把思考流打到「思考」通道，和正式回答在视觉上分开（淡色斜体，见 StreamView）。"""
+        if not self.quiet:
+            self._view().thinking(piece)
     def _end_thinking(self) -> None:
-        if self._thinking_open:
-            # 思考和正文靠颜色区分就够了，不用再画分隔线——
-            # 每一步都来一条，短思考会被装饰淹没。
-            print(flush=True)
-            self._thinking_open = False
+        self._view().close()
     def _fold_reasoning(self, content: str, native: str) -> str:
         """把模型的原生思考写进消息内容，让它和 <thinking> 走同一条因果链。
 
@@ -4355,52 +4887,44 @@ class Agent:
             detail=f"消息 {len(params['messages'])} 条 / 工具 {len(openai_tools)} 个",
         )
         if self.stream and not self.quiet:
-            stream = self.backend.create_chat_completion(**params, stream=True)
+            view = self._view()
+            view.wait()
             current_msg = {"role": "assistant", "content": ""}
             tool_calls_dict: dict[int, dict] = {}
             splitter = ThinkingSplitter()
             native_reasoning = ""
-            for chunk in stream:
-                if not chunk.choices:
-                    continue
-                delta = chunk.choices[0].delta
-                # DeepSeek-R1 / QwQ / vLLM 这类端点会把模型原生的推理放在
-                # reasoning_content 里。有就直接用——那是模型真实的思考过程，
-                # 一分钱不用多花，也不需要靠提示词去要。
-                piece = getattr(delta, "reasoning_content", None)
-                if piece:
-                    native_reasoning += piece
-                    self._print_thinking(piece)
-                if getattr(delta, "content", None):
-                    think_piece, answer_piece = splitter.feed(delta.content)
-                    if think_piece:
-                        self._print_thinking(think_piece)
-                    if answer_piece:
-                        print(answer_piece, end="", flush=True)
-                    current_msg["content"] += delta.content
-                if getattr(delta, "tool_calls", None):
-                    for tc in delta.tool_calls:
-                        idx = tc.index
-                        # 不同的 OpenAI-Compatible 服务端分片方式差别很大：有的第一片
-                        # 只带 id/type 不带 function，有的 id 要到后面才补上。旧实现
-                        # 假设第一片一定带 function（直接 tc.function.name → 崩），
-                        # 且 id 只从第一片取（晚到就永远是 None → tool_call_id 为空被 API 拒）。
-                        slot = tool_calls_dict.setdefault(
-                            idx, {"id": None, "type": "function", "function": {"name": "", "arguments": ""}}
-                        )
-                        if getattr(tc, "id", None):
-                            slot["id"] = tc.id
-                        fn = getattr(tc, "function", None)
-                        if fn is not None:
-                            if getattr(fn, "name", None):
-                                slot["function"]["name"] += fn.name
-                            if getattr(fn, "arguments", None):
-                                slot["function"]["arguments"] += fn.arguments
+            try:
+                stream = self.backend.create_chat_completion(**params, stream=True)
+                for chunk in stream:
+                    if not chunk.choices:
+                        continue
+                    delta = chunk.choices[0].delta
+                    # DeepSeek-R1 / QwQ / vLLM 这类端点会把模型原生的推理放在
+                    # reasoning_content 里。有就直接用——那是模型真实的思考过程，
+                    # 一分钱不用多花，也不需要靠提示词去要。
+                    piece = getattr(delta, "reasoning_content", None)
+                    if piece:
+                        native_reasoning += piece
+                        view.thinking(piece)
+                    if getattr(delta, "content", None):
+                        # 思考和回答分进两个块：以前回答会直接接在思考那一行后面，
+                        # 看着像思考的一部分。
+                        think_piece, answer_piece = splitter.feed(delta.content)
+                        view.thinking(think_piece)
+                        view.answer(answer_piece)
+                        current_msg["content"] += delta.content
+                    if getattr(delta, "tool_calls", None):
+                        # 模型开始写工具调用了。参数可能很长（write_file 要写整个文件），
+                        # 这段时间屏幕上一个字都不出，得接着转，不然看着像卡死。
+                        view.wait()
+                        self._merge_tool_call_deltas(tool_calls_dict, delta.tool_calls)
+                think_rest, answer_rest = splitter.finish()
+                view.thinking(think_rest)
+                view.answer(answer_rest)
+            finally:
+                view.end()
             if tool_calls_dict:
                 current_msg["tool_calls"] = [v for _, v in sorted(tool_calls_dict.items())]
-            splitter.finish()
-            self._end_thinking()
-            print()
             # 存进 messages 的是原样输出（含 <thinking>），后续每一步都看得到它——
             # 这正是「真 CoT」的关键：思考留在上下文里，才谈得上影响决策。
             current_msg["content"] = self._fold_reasoning(current_msg["content"], native_reasoning)
@@ -4410,7 +4934,13 @@ class Agent:
             visible = dict(current_msg)
             visible["content"] = splitter.answer.strip() if (splitter.thinking or native_reasoning) else current_msg["content"]
             return visible
-        res = self.backend.create_chat_completion(**params)
+        view = self._view()
+        if not self.quiet:
+            view.wait()
+        try:
+            res = self.backend.create_chat_completion(**params)
+        finally:
+            view.stop_wait()
         msg = res.choices[0].message
         built_msg = {"role": "assistant", "content": msg.content or ""}
         if msg.tool_calls:
@@ -4425,11 +4955,9 @@ class Agent:
         thinking, answer = ThinkingSplitter.split(msg.content or "")
         native = getattr(msg, "reasoning_content", "") or ""
         if not self.quiet:
-            for line in (native or thinking).splitlines():
-                self._print_thinking(line + "\n")
-            self._end_thinking()
-            if answer:
-                print(answer)
+            view.thinking(native or thinking)
+            view.answer(answer)
+            view.end()
         built_msg["content"] = self._fold_reasoning(built_msg["content"], native)
         self.messages.append(built_msg)
         self._trim_messages()
@@ -4438,6 +4966,26 @@ class Agent:
         if thinking or native:
             visible["content"] = answer
         return visible
+    @staticmethod
+    def _merge_tool_call_deltas(slots: dict[int, dict], deltas: Any) -> None:
+        """把流式 tool_call 分片拼回完整调用。"""
+        for tc in deltas:
+            idx = tc.index
+            # 不同的 OpenAI-Compatible 服务端分片方式差别很大：有的第一片
+            # 只带 id/type 不带 function，有的 id 要到后面才补上。旧实现
+            # 假设第一片一定带 function（直接 tc.function.name → 崩），
+            # 且 id 只从第一片取（晚到就永远是 None → tool_call_id 为空被 API 拒）。
+            slot = slots.setdefault(
+                idx, {"id": None, "type": "function", "function": {"name": "", "arguments": ""}}
+            )
+            if getattr(tc, "id", None):
+                slot["id"] = tc.id
+            fn = getattr(tc, "function", None)
+            if fn is not None:
+                if getattr(fn, "name", None):
+                    slot["function"]["name"] += fn.name
+                if getattr(fn, "arguments", None):
+                    slot["function"]["arguments"] += fn.arguments
     def _run_tools_and_feed_back(self, assistant_msg: dict) -> None:
         for tc in assistant_msg["tool_calls"]:
             name = tc["function"]["name"]
@@ -4447,8 +4995,8 @@ class Agent:
             except Exception:
                 args = {}
             # 用统一的符号前缀让对话流可以一眼扫读：● 是动作，⎿ 是它的结果。
-            print(f"\n{self.tag}  " + paint("●", "accent") + " " + paint(name, "bold")
-                  + paint(f"({_fit_display(args_str, 120)})", "dim"))
+            view = self._view()
+            view.tool_call(name, args_str)
             if self.trace_enabled:
                 TRACE_ENGINE.begin(f"Tool | {name}", args_str[:80], tool=name)
             started = time()
@@ -4460,10 +5008,7 @@ class Agent:
             if self.trace_enabled:
                 summary = f"{elapsed:.2f}s / {len(output)} 字符"
                 TRACE_ENGINE.finish(summary) if ok else TRACE_ENGINE.fail(f"失败 | {output.splitlines()[0][:80] if output else ''}")
-            preview = output.replace("\n", " ")
-            mark = paint("⎿", "gray") if ok else paint("⎿", "red")
-            body = _fit_display(preview, 140)
-            print(f"{self.tag}    {mark} " + paint(body, "dim" if ok else "red"))
+            view.tool_result(output, ok)
             dangerous, mutating = self._tool_flags(name)
             MOOD.record_tool(
                 name,
@@ -4533,6 +5078,11 @@ class Agent:
         denial = self._permission_denied(name)
         if denial:
             return denial, False
+        # 权限确认问完了，接下来工具在跑、屏幕上没字，让动画转起来。
+        # 只给内置工具转：插件是用户自己的代码，可能自己往屏幕上打字，会和动画抢同一行；
+        # 派发子代理也不转，子代理会自己打进度。
+        if not getattr(self, "quiet", True) and fn in BUILTIN_TOOLS and name not in {"delegate_task", "delegate_tasks"}:
+            self._view().wait()
         if found is not None:
             mcp_srv, orig_name, _ = found
             try:
@@ -4566,16 +5116,23 @@ class Agent:
             CURRENT_AGENT_CONTEXT.clear()
             CURRENT_AGENT_CONTEXT.update(prev_context)
     def _self_reflect(self) -> dict | None:
+        view = self._view()
         try:
             # 复用 _api_messages 拼好的前缀：反思和主调用共享同一段缓存，
             # 自己另拼一套等于把整段历史再按未缓存价算一遍。
             r_msg = self._api_messages() + [{"role": "user", "content": REFLECT_INSTRUCTION}]
-            res = self.backend.create_chat_completion(
-                model=self.model,
-                messages=r_msg,
-                max_tokens=600,
-                response_format={"type": "json_object"},
-            )
+            # 回答已经说完了，这一步是它回头检查自己。不转的话用户只会觉得「怎么还没好」。
+            if not self.quiet:
+                view.wait("回头检查")
+            try:
+                res = self.backend.create_chat_completion(
+                    model=self.model,
+                    messages=r_msg,
+                    max_tokens=600,
+                    response_format={"type": "json_object"},
+                )
+            finally:
+                view.stop_wait()
             verdict = _safe_json_load(res.choices[0].message.content or "")
             if verdict:
                 MOOD.record_reflection(bool(verdict.get("passed", True)), str(verdict.get("lesson", "")))
@@ -4583,8 +5140,8 @@ class Agent:
         except Exception:
             return None
 def evaluate_online_necessity(model: str = GATE_MODEL) -> bool:
-    if _env_bool("MINIAGENT_SKIP_GATE", False):
-        print("🟢 已通过环境变量跳过启动门禁。")
+    # MINIAGENT_SKIP_GATE 是门禁默认开着那会儿的开关，留着兼容老配置。
+    if not STARTUP_GATE or _env_bool("MINIAGENT_SKIP_GATE", False):
         return True
     print("🤖 正在唤醒启动评估门禁，让 Agent 决定是否上线...")
     try:
@@ -4608,12 +5165,13 @@ def evaluate_online_necessity(model: str = GATE_MODEL) -> bool:
             f"请进行决策。必须且只能返回标准的 JSON 结构，不允许有任何多余文字：\n"
             f'{{"status": "ONLINE" 或 "OFFLINE", "reason": "一句话用极其精练甚至幽默的中文说明判断理由"}}'
         )
-        res = backend.create_chat_completion(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=300,
-            response_format={"type": "json_object"},
-        )
+        with Spinner("评估要不要上线"):
+            res = backend.create_chat_completion(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=300,
+                response_format={"type": "json_object"},
+            )
         decision = _safe_json_load(res.choices[0].message.content or "") or {}
         status = str(decision.get("status", "ONLINE")).upper()
         reason = decision.get("reason", "未给出具体理由。")
@@ -5358,6 +5916,174 @@ def run_self_tests() -> str:
                        f"误伤只读 {len(blocked_reads)} 个"))
     except Exception as e:
         checks.append(("plan_mode_is_readonly", False, str(e)))
+    def _tiny_term(raw: str, width: int = 200) -> tuple[list[str], int]:
+        """极简终端：只认这套界面会用到的几种控制码，返回 (屏幕各行, 光标所在行)。
+        换行按真实终端的 onlcr 处理（\\n 同时回到行首）。"""
+        screen, row, col = [""], 0, 0
+        i = 0
+        while i < len(raw):
+            ch = raw[i]
+            if ch == "\x1b":
+                m = re.match(r"\x1b\[([0-9;?]*)([A-Za-z])", raw[i:])
+                if m:
+                    arg, op = m.group(1), m.group(2)
+                    if op == "A":
+                        row = max(0, row - int(arg or 1))
+                    elif op == "J":
+                        screen[row] = screen[row][:col]
+                        del screen[row + 1:]
+                    elif op == "K":
+                        screen[row] = screen[row][:col]
+                    i += m.end()
+                    continue
+            if ch == "\n":
+                row, col = row + 1, 0
+                while len(screen) <= row:
+                    screen.append("")
+            elif ch == "\r":
+                col = 0
+            else:
+                line = screen[row].ljust(col)
+                screen[row] = line[:col] + ch + line[col + 1:]
+                col += 1
+            i += 1
+        return screen, row
+    try:
+        # Markdown 排版：记号不能漏到屏幕上，折行不能超宽，代码缩进和 snake_case 不能被吃掉
+        md = MarkdownRenderer(30)
+        sample = [
+            "# 标题", "这是 **加粗** 和 `code` 还有*斜体*的字", "- 列表项目" + "很长" * 12,
+            "```py", "    x = 1", "```", "> 引用一句", "1. 第一步", "| a | b |",
+            "2*3*4 与 __init__ 还有 snake_case_name 保持原样",
+        ]
+        rows = [_ANSI_RE.sub("", r) for line in sample for r in md.render(line, "  ", "  ")]
+        text = "\n".join(rows)
+        ok = (
+            rows[0].strip() == "标题"
+            and "**" not in text and "```" not in text and "`" not in text
+            and "斜体" in text and "*斜体*" not in text
+            and any(r.startswith("  • 列表项目") for r in rows)
+            and any(r.startswith("    长") for r in rows)         # 列表折行悬挂缩进
+            and "│     x = 1" in text                               # 代码缩进保住
+            and "2*3*4" in text and "__init__" in text and "snake_case_name" in text
+            and all(_display_width(r) <= 30 for r in rows)
+        )
+        checks.append(("markdown_render", ok, f"{len(sample)} 种写法｜记号不外露｜最宽 {max(_display_width(r) for r in rows)}/30"))
+    except Exception as e:
+        checks.append(("markdown_render", False, str(e)))
+    try:
+        # 流式排版：边流边擦边重画（动画模式）和一行收全再排（无动画模式），
+        # 最后留在屏幕上的必须一模一样——擦除算错一排，这里就对不上。
+        pieces = [("t", "先读"), ("t", "文件"), ("a", "这是 **加"), ("a", "粗** 文字"),
+                  ("a", "\n\n- 项"), ("a", "目一\n- 项目二\n``"), ("a", "`bash\nls -la\n``"),
+                  ("a", "`\n" + "很长的一段话" * 9), ("a", "\n\n  \n结尾\n\n")]
+        screens = {}
+        for live in (True, False):
+            buf = io.StringIO()
+            view = StreamView(render=True, animate=live, width=30, out=buf)
+            for kind, piece in pieces:
+                (view.thinking if kind == "t" else view.answer)(piece)
+            view.end()
+            lines = [_ANSI_RE.sub("", line).rstrip() for line in _tiny_term(_ANSI_RE.sub(
+                lambda m: m.group(0) if m.group(0)[-1] in "AJK" else "", buf.getvalue()))[0]]
+            while lines and not lines[-1]:
+                lines.pop()
+            screens[live] = lines
+        shown = screens[True]
+        joined = "\n".join(shown)
+        think_row = next((i for i, line in enumerate(shown) if "先读文件" in line), -1)
+        answer_row = next((i for i, line in enumerate(shown) if "这是 加粗 文字" in line), -1)
+        ok = (
+            screens[True] == screens[False]
+            and 0 <= think_row < answer_row                      # 思考和回答各占各的行
+            and shown[answer_row].startswith("✦ ")
+            and "**" not in joined and "```" not in joined
+            and "\n\n\n" not in joined                            # 多余的空行被并掉
+            and all(_display_width(line) <= 30 for line in shown)
+            and shown[-1].strip() == "结尾"                       # 块尾的空行不留
+        )
+        checks.append(("stream_view_layout", ok, f"动画/无动画终屏一致 {'OK' if screens[True] == screens[False] else 'FAIL'}｜{len(shown)} 行"))
+    except Exception as e:
+        checks.append(("stream_view_layout", False, str(e)))
+    try:
+        # 等待动画：转完不能在屏幕上留下任何东西，光标要回到原来那一行
+        real_stdout = sys.stdout
+        buf = io.StringIO()
+        sys.stdout = buf
+        try:
+            spin = Spinner("测试", enabled=True, gap=True).start()
+            sleep_until = time() + Spinner.DELAY + Spinner.INTERVAL * 3
+            while time() < sleep_until:
+                threading.Event().wait(0.02)
+            spin.stop()
+            spin.stop()  # 停两次也不能出事
+            quick = Spinner("一闪而过", enabled=True).start()
+            quick.stop()  # 短于 DELAY：一帧都不该画
+        finally:
+            sys.stdout = real_stdout
+        raw = buf.getvalue()
+        screen, cursor_row = _tiny_term(raw)
+        frames_differ = Spinner("x").frame(0, 0) != Spinner("x").frame(1, 0)
+        plain = _ANSI_RE.sub("", raw)  # 开着颜色时每个字单独上色，要先去掉转义码再找字
+        ok = ("测试" in plain and "一闪而过" not in plain and cursor_row == 0
+              and not "".join(screen).strip() and raw.endswith("\x1b[?25h") and frames_differ
+              and not Spinner(enabled=False).start().running)
+        checks.append(("spinner_leaves_no_trace", ok, f"画了 {raw.count(chr(13)) - 1} 帧｜擦净 OK｜短等待不闪 OK"))
+    except Exception as e:
+        checks.append(("spinner_leaves_no_trace", False, str(e)))
+    try:
+        # 这条是用户截图里的 bug：同一步里先想后答，回答被接在思考那一行后面
+        class _OneChunkBackend(ChatBackend):
+            name = "selftest_one_chunk"
+            def create_chat_completion(self, **kwargs):
+                delta = types.SimpleNamespace(content="<thinking>先想想</thinking>这是回答", tool_calls=None)
+                return iter([types.SimpleNamespace(choices=[types.SimpleNamespace(delta=delta)])])
+        probe = Agent.__new__(Agent)
+        probe.backend, probe.model, probe.max_tokens = _OneChunkBackend(), "m", 16
+        probe.stream, probe.quiet, probe.tag = True, False, ""
+        probe.tools, probe.mcp_servers, probe._mcp_tool_map = {}, {}, {}
+        probe.messages, probe.max_context_messages, probe.max_context_tokens = [], 40, MAX_CONTEXT_TOKENS
+        probe.trace_enabled, probe.last_reasoning, probe._native_reasoning_seen = False, "", False
+        probe._api_messages = lambda: []
+        buf = io.StringIO()
+        probe._stream_view = StreamView(render=False, animate=False, out=buf)
+        visible = probe._call_llm()
+        out = _ANSI_RE.sub("", buf.getvalue())
+        ok = "先想想这是回答" not in out and "先想想\n" in out and "这是回答" in out and visible["content"] == "这是回答"
+        checks.append(("thinking_answer_separate", ok, "思考和回答不再挤在同一行"))
+    except Exception as e:
+        checks.append(("thinking_answer_separate", False, str(e)))
+    try:
+        # exit 不带斜杠也要能退；Ctrl+C 打断之后历史里不能留半截工具调用；启动门禁默认关
+        words_ok = all(_is_exit_word(w) for w in ["exit", "  EXIT ", "quit", "退出"]) and not _is_exit_word("exit now")
+        listed = any(cmd == "/exit" for _, items in COMMAND_GROUPS for cmd, _ in items)
+        probe = Agent.__new__(Agent)
+        probe.tag = ""
+        probe._stream_view = StreamView(render=False, animate=False, out=io.StringIO())
+        probe.messages = [
+            {"role": "user", "content": "读两个文件"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "a", "type": "function", "function": {"name": "read_file", "arguments": "{}"}},
+                {"id": "b", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "a", "name": "read_file", "content": "ok"},
+        ]
+        probe.interrupt()
+        answered = {m.get("tool_call_id") for m in probe.messages if m.get("role") == "tool"}
+        repaired = answered == {"a", "b"} and probe.messages[-1]["role"] == "assistant"
+        original_build = globals()["build_backend"]
+        def _no_backend():
+            raise AssertionError("门禁默认关着，不该去连模型")
+        globals()["build_backend"] = _no_backend
+        try:
+            gate_ok = STARTUP_GATE or evaluate_online_necessity() is True
+        finally:
+            globals()["build_backend"] = original_build
+        ok = words_ok and listed and repaired and gate_ok
+        checks.append(("exit_interrupt_gate", ok,
+                       f"exit {'OK' if words_ok and listed else 'FAIL'}｜打断补全 {'OK' if repaired else 'FAIL'}｜"
+                       f"门禁默认关 {'OK' if gate_ok else 'FAIL'}"))
+    except Exception as e:
+        checks.append(("exit_interrupt_gate", False, str(e)))
     try:
         lines = []
         for name, passed, detail in checks:
@@ -5698,7 +6424,7 @@ COMMAND_GROUPS: list[tuple[str, list[tuple[str, str]]]] = [
         ("/reset", "清空当前会话与待办"),
         ("/reflect", "开关每回合的自我检查"),
         ("/thought [on|off|preview]", "思考轨迹的显示方式"),
-        ("exit", "退出"),
+        ("/exit", "退出（直接打 exit 也行）"),
     ]),
     ("记忆", [
         ("/memory [n]", "查看长期记忆与它们的遗忘曲线"),
@@ -5771,7 +6497,7 @@ def _box(lines: list[str], width: int = 58) -> list[str]:
     return [top, *body, bottom]
 def render_banner() -> str:
     out = _box([
-        (f"Polaris v{VERSION} · {CODENAME}", ("bold",)),
+        (f"✦ Polaris v{VERSION} · {CODENAME}", ("bold",)),
         ("记忆会遗忘，思考留痕迹，人格在生长", ("dim",)),
     ])
     out.append("")
@@ -5794,6 +6520,52 @@ def render_help() -> str:
         for cmd, desc in items:
             out.append("  " + paint(_pad_display(cmd, width), "accent") + paint(desc, "dim"))
     return "\n".join(out)
+def _enable_line_editing() -> bool:
+    """让输入行支持方向键、行内编辑和 ↑ 翻历史。
+
+    Python 的 input() 只有在 readline 被导入过之后才有这些；没导入的话按方向键
+    只会打出 ^[[D 这样的乱码。Windows 没有这个模块，跳过即可，它的控制台自带行编辑。"""
+    try:
+        import readline  # noqa: F401
+        return True
+    except Exception:
+        return False
+def _input_prompt(line_editing: bool) -> str:
+    text = paint("你 ", "accent") + paint("› ", "dim")
+    # stdin 不是终端时 readline 不接管输入，\001 \002 会被原样写出去
+    if line_editing and _COLOR and sys.stdin.isatty():
+        # 转义码要用 \001 \002 包起来，readline 才知道它们不占宽度；
+        # 不包的话一按方向键，光标位置就全乱了。
+        text = _ANSI_RE.sub(lambda m: "\001" + m.group(0) + "\002", text)
+    return text
+_EXIT_WORDS = {"exit", "quit", "退出"}
+def _is_exit_word(text: str) -> bool:
+    """不带斜杠的 exit 也要能退出——/help 里写着呢，以前却会被当成一句话发给模型。"""
+    return text.strip().lower() in _EXIT_WORDS
+def _startup_status(agent: Agent, width: int) -> list[str]:
+    """开屏横幅下面那两行摘要。按终端宽度截断，所以只放真正有用的信息：
+    完整的端点 URL、工作区摘要这类长东西，截一半等于没写。"""
+    bits = [f"模型 {MODEL}"]
+    if BACKEND_NAME not in {"openai_compatible", "openai-compatible", "openai"}:
+        bits.append(f"后端 {BACKEND_NAME}")
+    if BASE_URL:
+        bits.append(f"端点 {urlparse(BASE_URL).netloc or BASE_URL}")
+    bits.append(f"工具 {agent.tool_profile}({tool_profile_cost(agent.tool_profile)[0]})")
+    state = [f"记忆 {len(MEMORY.items)} 条", f"心情 {MOOD.label()}",
+             f"信任 {RELATIONSHIP.state.get('trust', 0)}", f"文件 {len(WORKSPACE.file_index)} 个"]
+    if WORKSPACE.recent_files:
+        state.append(f"最近改动 {Path(WORKSPACE.recent_files[0]['path']).name}")
+    lines = [" · ".join(bits), " · ".join(state)]
+    extras = []
+    if agent.instructions:
+        extras.append("已注入项目自定义指令")
+    if agent.loaded_plugins:
+        extras.append(f"插件 {len(agent.loaded_plugins)} 个")
+    if _looks_local_endpoint(BASE_URL) or BACKEND_NAME in {"ollama", "lmstudio", "local"}:
+        extras.append("本地兼容服务模式")
+    if extras:
+        lines.append(" · ".join(extras))
+    return [paint("  " + _fit_display(line, width - 2), "dim") for line in lines]
 def main():
     if BACKEND_NAME in {"ollama", "lmstudio", "local"}:
         pass
@@ -5806,32 +6578,23 @@ def main():
     print(render_banner())
     # 旧版在这里一口气打印 11 行内部状态，人格那行 150 格宽，窄终端上直接折成一团。
     # 现在压成两行摘要，完整信息本来就有 /state、/doctor、/persona 可以看。
-    tools_n, tools_t = tool_profile_cost(agent.tool_profile)
-    line1 = f"模型 {MODEL} · 后端 {agent.backend_name} · 工具 {agent.tool_profile}({tools_n})"
-    if BASE_URL:
-        line1 += f" · 端点 {_fit_display(BASE_URL, 28)}"
-    mood_label = MOOD.label()
-    line2 = (f"记忆 {len(MEMORY.items)} 条 · 心情 {mood_label} · "
-             f"信任 {RELATIONSHIP.state.get('trust', 0)} · {WORKSPACE.compact()}")
-    print(paint("  " + _fit_display(line1, 72), "dim"))
-    print(paint("  " + _fit_display(line2, 72), "dim"))
-    extras = []
-    if agent.instructions:
-        extras.append("已注入项目自定义指令")
-    if agent.loaded_plugins:
-        extras.append(f"插件 {len(agent.loaded_plugins)} 个")
-    if _looks_local_endpoint(BASE_URL) or BACKEND_NAME in {"ollama", "lmstudio", "local"}:
-        extras.append("本地兼容服务模式")
-    if extras:
-        print(paint("  " + " · ".join(extras), "dim"))
+    for line in _startup_status(agent, _term_width()):
+        print(line)
+    line_editing = _enable_line_editing()
+    prompt = _input_prompt(line_editing)
     while True:
         try:
-            user_input = input(paint("\n你 ", "accent") + paint("› ", "dim")).strip()
+            # 提示符前的空行单独打：提示符里带换行的话，readline 重画这一行时会错位。
+            print()
+            user_input = input(prompt).strip()
         except (KeyboardInterrupt, EOFError):
             print(paint("\n再见！", "dim"))
             break
         if not user_input:
             continue
+        if _is_exit_word(user_input):
+            print(paint("再见！", "dim"))
+            break
         handled, next_input = handle_cli_command(agent, user_input)
         if handled:
             if next_input == "__exit__":
@@ -5839,11 +6602,16 @@ def main():
             if next_input is None:
                 continue
             user_input = next_input
-        print("\nPolaris > ", end="", flush=True)
         try:
             agent.chat(user_input)
+        except KeyboardInterrupt:
+            # 以前 Ctrl+C 会把整个程序带走，连同这次会话的上下文；
+            # 现在只打断这一回合，会话还在。
+            agent.interrupt()
+            print(paint("\n  已打断这一轮。接着说就行。", "dim"))
         except Exception as e:
-            print(f"\n[运行异常] {e}")
+            agent.interrupt()
+            print(paint(f"\n[运行异常] {e}", "red"))
 def run_selftest_cli() -> int:
     """命令行方式跑自检，返回退出码：0 全过，1 有检查没过。
 
