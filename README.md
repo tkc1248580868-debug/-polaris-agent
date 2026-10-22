@@ -6,7 +6,7 @@
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Dependencies](https://img.shields.io/badge/dependencies-1-brightgreen)
-![Single file](https://img.shields.io/badge/single--file-7.6k%20lines-orange)
+![Single file](https://img.shields.io/badge/single--file-7.8k%20lines-orange)
 ![Version](https://img.shields.io/badge/version-1.1.6-lightgrey)
 
 An open-source autonomous AI agent with a persistent personality, long-term
@@ -50,7 +50,7 @@ python polaris_1_1_6_memorycurve.py --selftest    # exits non-zero if anything f
 
 or `/selftest` from inside a session.
 
-Thirty-eight checks covering the sandbox, the shell guard, file-edit safety,
+Thirty-nine checks covering the sandbox, the shell guard, file-edit safety,
 context assembly, the trace tree, the memory curve, and the terminal UI. No API
 key required.
 
@@ -116,7 +116,7 @@ The screen also shows the inner state the rest of this README describes:
 
 ### One file, one dependency
 
-7,600 lines of Python, no framework, no vector database, no build step. Copy it
+7,800 lines of Python, no framework, no vector database, no build step. Copy it
 anywhere and run it.
 
 ---

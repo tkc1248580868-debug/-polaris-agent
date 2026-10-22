@@ -165,7 +165,7 @@ file edit.
 
 ### Self-tests
 
-`/selftest` runs a thirty-eight-check suite covering JSON parsing, context building,
+`/selftest` runs a thirty-nine-check suite covering JSON parsing, context building,
 snapshot round-trip, calculator sandbox escapes, shell guard rules, context
 starvation, step-budget direction, trace wiring, sub-agent isolation, tool
 description coverage, and three memory checks — curve direction and the spacing
@@ -176,7 +176,8 @@ tool-call assembly, whether the chain of thought is actually causal, the
 file-editing safety rules, and the terminal UI — Markdown rendering, live redraw
 matching the line-by-line layout exactly, the spinner leaving no trace, thinking
 kept apart from the answer, and `exit` / Ctrl+C / the startup gate — plus one
-check for each of the four views below. No API key required.
+check for each of the four views below and one that pins the bugs an
+adversarial review found in them. No API key required.
 
 It runs in CI too. `python polaris_1_1_6_memorycurve.py --selftest` exits non-zero
 if any check fails, and GitHub Actions runs it on every push across Python
@@ -451,8 +452,10 @@ off` or `POLARIS_SHOW_RECALL=0` turns it off.
 ```
 
 **A spinner with a mood.** Frustrated (≥35), the shimmer runs twice as fast
-and the label says 换个思路. Tired (fatigue ≥60, the line where the step
-budget really drops), it dims and breathes slower. The startup mood line only
+and the label says 有点受挫. Tired (fatigue ≥60, the line where the step
+budget really drops), it dims and breathes slower. The labels only name the
+mood — never an action such as "trying another approach", because at these
+levels no code takes one. The startup mood line only
 states what the code does: a smaller or larger step budget, and the advice the
 model is given. Nothing splits tasks or delegates because of mood, so it never
 says so.

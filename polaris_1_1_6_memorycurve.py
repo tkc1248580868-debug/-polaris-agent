@@ -166,14 +166,17 @@ class Spinner:
     def frame(self, tick: int, elapsed: float) -> str:
         text = self.label + "…"
         hint_text = f"（{int(elapsed)}s · Ctrl+C 打断）"
-        # 一帧必须比终端窄：折到第二行的话，停下时只擦得掉一行，会留下半截动画
-        width = _term_width()
+        # 一帧必须比终端窄：折到第二行的话，停下时只擦得掉一行，会留下半截动画。
+        # _term_width() 最小只到 20，比它还窄的终端得看真实列数
+        width = min(_term_width(), shutil.get_terminal_size((80, 24)).columns - 1)
+        star = paint(self.FRAMES[tick % len(self.FRAMES)], *(("accent", "dim") if self.faint else ("accent",)))
         if 2 + _display_width(text) + 1 + _display_width(hint_text) > width:
             hint_text = f"（{int(elapsed)}s）"
         room = width - 3 - _display_width(hint_text)
+        if room < 4:
+            return star  # 连「x…（Ns）」都放不下：只剩一颗星在呼吸
         if _display_width(text) > room:
             text = _fit_display(text, max(2, room))
-        star = paint(self.FRAMES[tick % len(self.FRAMES)], *(("accent", "dim") if self.faint else ("accent",)))
         # 光从左边外面扫进来、从右边扫出去，然后从头再来；正中最亮，两侧渐暗。
         # faint（累了）时整体压暗一档，最亮也只到 glow——同一个蓝，只是没精神
         center = (tick * self.sweep) % (len(text) + 6) - 3
@@ -254,17 +257,20 @@ def spinner_mood(state: dict | None) -> SpinnerMood | None:
 
     先到先得的顺序就是轻重缓急：
     - 受挫 ≥ 35：基线 12，一次失败的工具净涨 5 左右，35 大约是「最近接连失败四五次还没缓过来」。
-      光扫得快一倍，动词换成「换个思路」——这是唯一会在一回合里跳变的维度，紧跟在红色的 ⎿ 后面。
+      光扫得快一倍——这是唯一会在一回合里跳变的维度，紧跟在红色的 ⎿ 后面。
     - 疲劳 ≥ 60：和 turn_budget 第一次砍步数的线是同一条，动画变暗变慢的时候，步数预算也真的少了。
     - 自信 ≥ 72 且受挫 < 20：大约连续成功 18~20 次工具才到得了，叫它「兴冲冲」不算夸张。
     - 专注 ≥ 62：只有歇了一周左右才会涨到这儿。
-    - 好奇 ≥ 56：几乎碰不到（每次 +1 都会被 rebalance 抵消），留着是为了恢复快照或手改状态时也说得通。"""
+    - 好奇 ≥ 56：几乎碰不到（每次 +1 都会被 rebalance 抵消），留着是为了恢复快照或手改状态时也说得通。
+
+    动词只说心情，不说它没在做的事：受挫、疲劳这两档上，没有任何代码会让模型「换个思路」
+    或「再检查一遍」（MoodState.advice 要到 70、75 才给模型提醒），写成那样就是在骗人。"""
     if not isinstance(state, dict) or not state:
         return None
     if _mood_int(state, "frustration") >= 35:
-        return SpinnerMood("frustrated", "换个思路", sweep=2)
+        return SpinnerMood("frustrated", "有点受挫，接着找", sweep=2)
     if _mood_int(state, "fatigue") >= 60:
-        return SpinnerMood("tired", "揉揉眼睛，再看一遍", interval=0.14, faint=True)
+        return SpinnerMood("tired", "有点累，慢慢来", interval=0.14, faint=True)
     if _mood_int(state, "confidence") >= 72 and _mood_int(state, "frustration") < 20:
         return SpinnerMood("on_a_roll", "兴冲冲地翻找")
     if _mood_int(state, "focus") >= 62:
@@ -489,6 +495,9 @@ def _ago(value: Any, now: datetime.datetime) -> str:
     if sec < 48 * 3600:
         return f"{int(sec // 3600)} 小时前"
     return f"{int(sec // 86400)} 天前"
+def _todo_stamp() -> str:
+    # 带时区：夏令时切换那一晚，不带时区的本地时间会让「用时」多出或少掉一小时
+    return datetime.datetime.now().astimezone().replace(microsecond=0).isoformat()
 def _todo_duration(items: list[dict]) -> str:
     """整张清单用了多久：从列出清单到最后一项打勾。每一项都带时间戳才算，缺一项就不说——不编。
     这是挂钟时间，中间关掉程序、隔天再来做完的，也算在里面。"""
@@ -497,9 +506,12 @@ def _todo_duration(items: list[dict]) -> str:
         ends = [datetime.datetime.fromisoformat(str(it["done_at"])) for it in items]
     except (KeyError, TypeError, ValueError):
         return ""
-    if not starts:
+    if not starts or any(t.tzinfo is None for t in starts + ends):
+        return ""  # 没时区的时间戳算不准，宁可不说
+    seconds = (max(ends) - min(starts)).total_seconds()
+    if seconds < 0:
         return ""
-    minutes = max(0.0, (max(ends) - min(starts)).total_seconds()) / 60
+    minutes = seconds / 60
     if minutes < 1:
         return "不到 1 分钟"
     if minutes < 60:
@@ -519,7 +531,8 @@ def render_constellation(items: list[dict], width: int, *, indent: str = "  ", c
     if not n:
         return []
     all_done = all(done)
-    cur = next((i for i, d in enumerate(done) if not d), None) if show_current else None
+    # 一行版没有「↑ 正在做」那行字，当前那颗要是也画成亮的 ✦，关掉颜色后就和做完的分不清了
+    cur = next((i for i, d in enumerate(done) if not d), None) if show_current and not compact else None
     def star(i: int) -> str:
         if all_done:
             return paint("✦", "shine", "bold")
@@ -536,7 +549,11 @@ def render_constellation(items: list[dict], width: int, *, indent: str = "  ", c
     summary = ""
     if all_done:
         took = _todo_duration(items)
-        summary = (paint("✓", "accent") + " " + paint(f"{goal or '全部完成'} · {n} 步" + (f" · 用时 {took}" if took else ""), "dim"))
+        text = f"{goal or '全部完成'} · {n} 步"
+        room = width - _visible_width(indent) - 2
+        if took and _display_width(text + f" · 用时 {took}") <= room:
+            text += f" · 用时 {took}"  # 放不下就整段不要，不截成半句「用时 11 小」
+        summary = paint("✓", "accent") + " " + paint(_fit_display(text, max(4, room)), "dim")
     if compact:
         row = indent + "".join(star(i) + (link(i, 3) if i < n - 1 else "") for i in range(n))
         tail = f" {sum(done)}/{n}"
@@ -807,15 +824,25 @@ class StreamView:
         whens = [self._recall_when(r, now) for r in shown]
         contents = [_clean_line(r.get("content", "")) for r in shown]
         width = self.width - _display_width(self.tag)
-        # 「  · 」+ 内容 +「  」+ 5 格 +「 」+ 时间；内容栏对齐，进度条才排得成一列
+        # 「  · 」+ 内容 +「  」+ 5 格 +「 」+ 时间；内容栏对齐，进度条才排得成一列。
+        # 终端太窄时先丢时间、再丢进度条，内容至少留 8 格——宁可少说，也不折行
+        show_when, show_bar = True, True
         room = width - 4 - 2 - 5 - 1 - max(_display_width(w) for w in whens)
-        col = max(8, min(max(_display_width(c) for c in contents), room))
-        lines = [f"\n{self.tag}" + paint("◌", "accent") + " " + paint(f"想起 {len(rows)} 件事", "dim")]
+        if room < 8:
+            show_when, room = False, width - 4 - 2 - 5
+        if room < 8:
+            show_bar, room = False, width - 4
+        col = max(4, min(max(_display_width(c) for c in contents), room))
+        lines = [f"\n{self.tag}" + paint("◌", "accent") + " " + paint(_fit_display(f"想起 {len(rows)} 件事", max(4, width - 2)), "dim")]
         for row, text, when in zip(shown, contents, whens):
             faint = when in ("正在淡去", "被唤醒")
-            lines.append(f"{self.tag}  " + paint("·", "dim") + " "
-                         + paint(_pad_display(_fit_display(text, col), col), *(("dim",) if faint else ()))
-                         + "  " + _paint_bar(_retention_bar(row.get("retention", 1.0))) + " " + paint(when, "dim"))
+            line = (f"{self.tag}  " + paint("·", "dim") + " "
+                    + paint(_pad_display(_fit_display(text, col), col), *(("dim",) if faint else ())))
+            if show_bar:
+                line += "  " + _paint_bar(_retention_bar(row.get("retention", 1.0)))
+            if show_when:
+                line += " " + paint(when, "dim")
+            lines.append(line)
         if len(rows) > 3:
             lines.append(f"{self.tag}    " + paint(f"… 还有 {len(rows) - 3} 件", "dim"))
         self._write("\n".join(lines) + "\n")
@@ -826,9 +853,13 @@ class StreamView:
         self.close()
         lead = f"{self.tag}  " if as_result else f"\n{self.tag}"
         tail = "  " + paint("▰▰▰▰▰", "accent") + " " + paint("新", "dim")
-        room = self.width - _visible_width(lead) - 2 - _display_width(label) - 1 - 9
+        # 「✎ 」两格 + 「标签：」+ 内容 + 尾巴，加起来不能超过 width；窄到放不下时先丢进度条
+        fixed = _visible_width(lead.lstrip("\n")) + 2 + _display_width(f"{label}：")
+        room = self.width - fixed - _visible_width(tail)
+        if room < 8:
+            tail, room = "", self.width - fixed
         self._write(lead + paint("✎", "accent") + " " + paint(f"{label}：", "dim")
-                    + _fit_display(_clean_line(content), max(8, room)) + tail + "\n")
+                    + _fit_display(_clean_line(content), max(4, room)) + tail + "\n")
         return True
     # ── 任务进度 ──
     FLASH_INTERVAL = 0.09
@@ -846,21 +877,29 @@ class StreamView:
             return False
         first = f"{self.tag}  " + paint("⎿", "gray") + " "
         rest = [f"{self.tag}    " + row for row in rows[1:]]
-        if not (flash and self.live):
+        # 只有横排时第一行才是整串星座；竖排的第一行只是第一项，闪它会像是第一项刚做完
+        if not (flash and self.live and "完成" in _ANSI_RE.sub("", rows[0])):
             self._write("\n".join([first + rows[0]] + rest) + "\n")
             return True
         # 最后一项打勾：整串星座闪三下再定住。只在这一行上原地重画（\r），不往上挪光标，
-        # 所以闪完留在屏幕上的和不闪时一模一样
+        # 所以闪完留在屏幕上的和不闪时一模一样。闪的时候按 Ctrl+C：先把剩下的画完，再把打断交出去
         bright = paint(_ANSI_RE.sub("", rows[0]), "shine", "bold")
+        interrupted = False
         try:
             self._write("\x1b[?25l" + first + rows[0])
-            for _ in range(3):
-                for frame in (bright, rows[0]):
-                    threading.Event().wait(self.FLASH_INTERVAL)
-                    self._write("\r" + first + frame + "\x1b[K")
+            try:
+                for _ in range(3):
+                    for frame in (bright, rows[0]):
+                        threading.Event().wait(self.FLASH_INTERVAL)
+                        self._write("\r" + first + frame + "\x1b[K")
+            except KeyboardInterrupt:
+                interrupted = True
+                self._write("\r" + first + rows[0] + "\x1b[K")
             self._write("\n" + "".join(line + "\n" for line in rest))
         finally:
             self._write("\x1b[?25h")
+        if interrupted:
+            raise KeyboardInterrupt
         return True
     def notice(self, text: str, *styles: str) -> None:
         self.stop_wait()
@@ -1230,7 +1269,11 @@ def _parse_dt(value: Any, fallback: datetime.datetime) -> datetime.datetime:
     if not text:
         return fallback
     try:
-        return datetime.datetime.fromisoformat(text)
+        # 记忆文件可以手改、也可以从别处同步过来，里面可能是带时区的时间（…Z、…+08:00）。
+        # 全程拿它和不带时区的「现在」相减，所以统一换成本地时间、去掉时区——不然一减就崩。
+        # 3.10 的 fromisoformat 还不认结尾的 Z，先换成 +00:00
+        dt = datetime.datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text)
+        return dt.astimezone().replace(tzinfo=None) if dt.tzinfo is not None else dt
     except ValueError:
         pass
     try:  # 只有日期的老格式（2026-09-07）按当天零点算。
@@ -1871,14 +1914,14 @@ class TodoList:
     def set(self, todos: list[str]) -> None:
         # created_at / done_at 只给界面上的「用时」用；发给模型的 render() 一个字都不变。
         # 老文件里的条目没有时间戳，那就不显示用时，绝不估一个出来
-        now = _iso(_now_dt())
+        now = _todo_stamp()
         self.items = [{"text": str(t).strip(), "done": False, "created_at": now} for t in todos if str(t).strip()]
         self._save()
     def complete(self, index: int) -> bool:
         if 1 <= index <= len(self.items):
             item = self.items[index - 1]
             if not item.get("done"):
-                item["done_at"] = _iso(_now_dt())  # 重复打勾不刷新完成时间
+                item["done_at"] = _todo_stamp()  # 重复打勾不刷新完成时间
             item["done"] = True
             self._save()
             return True
@@ -3414,12 +3457,8 @@ class ExperienceModel:
 EXPERIENCE = ExperienceModel(ARCHIVE)
 class ReasonEngine:
     """决策引擎：把世界模型、心情、记忆和历史档案压成可执行的策略摘要。"""
-    def snapshot(self) -> dict:
-        mood = MOOD.snapshot()
-        recent_files = len(WORKSPACE.recent_files)
-        special_files = len(WORKSPACE.special_files)
-        todo_count = len(TODOS.items)
-        file_count = len(WORKSPACE.file_index)
+    @staticmethod
+    def _risk(mood: dict) -> int:
         risk = 0
         if mood["fatigue"] >= 75:
             risk += 2
@@ -3427,14 +3466,22 @@ class ReasonEngine:
             risk += 2
         if mood["confidence"] <= 30:
             risk += 2
-        if recent_files >= 12:
+        if len(WORKSPACE.recent_files) >= 12:
             risk += 1
-        if special_files >= 5:
+        if len(WORKSPACE.special_files) >= 5:
             risk += 1
-        if todo_count >= 6:
+        if len(TODOS.items) >= 6:
             risk += 1
-        if file_count == 0:
+        if len(WORKSPACE.file_index) == 0:
             risk = max(0, risk - 1)
+        return risk
+    def snapshot(self) -> dict:
+        mood = MOOD.snapshot()
+        recent_files = len(WORKSPACE.recent_files)
+        special_files = len(WORKSPACE.special_files)
+        todo_count = len(TODOS.items)
+        file_count = len(WORKSPACE.file_index)
+        risk = self._risk(mood)
         if risk >= 6:
             verdict = "高风险"
             recommendation = "优先拆任务、先复核、必要时调用子代理。"
@@ -3466,13 +3513,17 @@ class ReasonEngine:
         应对方式是更谨慎的策略（见 policy_note：拆任务、先复核、必要时委托），
         而不是更小的步数预算。所以这里同样是加而不是减。
         """
-        budget = MOOD.turn_budget()
-        s = self.snapshot()
-        if s["risk"] >= 5:
+        return self.budget_for(MOOD)
+    def budget_for(self, mood: "MoodState") -> int:
+        """给定一份心情，这一回合会有几步。开屏那行心情用它来预测——
+        和真正跑循环时走同一段代码，说出来的步数才不会差一两步。"""
+        budget = mood.turn_budget()
+        risk = self._risk(mood.state)
+        if risk >= 5:
             budget += 3
-        elif s["risk"] >= 3:
+        elif risk >= 3:
             budget += 1
-        if s["todo_count"] >= 8:
+        if len(TODOS.items) >= 8:
             budget += 1
         return max(12, min(20, budget))
     def policy_note(self) -> str:
@@ -5098,7 +5149,9 @@ class Agent:
             return
         kind, rows = self._injected_memories()
         if rows:
-            self._trace_event(f"想起 {len(rows)} 条记忆", TraceLevel.INFO,
+            # 没线索时顺手带上的最近几条不叫「想起」，轨迹里也得这么记
+            title = f"想起 {len(rows)} 条记忆" if kind == "recall" else f"附带最近 {len(rows)} 条记忆（没有检索线索）"
+            self._trace_event(title, TraceLevel.INFO,
                               detail=" · ".join(f"#{r['id']} R={r['retention']:.2f}" for r in rows),
                               ids=[r["id"] for r in rows], kind=kind)
         if kind == "recall" and rows and getattr(self, "show_recall", SHOW_RECALL):
@@ -5111,11 +5164,15 @@ class Agent:
         它一变，后面整段对话历史的缓存前缀全部作废。
         对话越长，这笔浪费越大。所以易变的部分挪到末尾（见 _runtime_context_message）。"""
         self.instructions = self.reload_instructions()
+        # 运行时上下文只拼一次，缓存键和正文共用这一份。以前这里拼两次：第二次拼的时候
+        # 第一次已经把记忆「复习」过了，记忆闪回拿到的就成了复习之后的满格；
+        # 两次之间工作区要是刷新过，存进缓存的正文和缓存键也对不上
+        note = self._runtime_context_note() if CONTEXT_POSITION == "system" else ""
         cache_key = "|".join([
             self.system_base, self.instructions, self.model,
             f"native_cot={self._native_reasoning_seen}",
             f"ctx_pos={CONTEXT_POSITION}",
-            self._runtime_context_note() if CONTEXT_POSITION == "system" else "",
+            note,
         ])
         if cache_key == self._system_prompt_cache_key and self._system_prompt_cache:
             return self._system_prompt_cache
@@ -5127,7 +5184,7 @@ class Agent:
         if self.instructions:
             parts.append("[项目自定义指令]\n" + self.instructions)
         if CONTEXT_POSITION == "system":
-            parts.append(self._runtime_context_note())  # 1.1.6 之前的老排法
+            parts.append(note)  # 1.1.6 之前的老排法
         prompt = "\n\n".join(parts)
         self._system_prompt_cache_key = cache_key
         self._system_prompt_cache = prompt
@@ -5393,19 +5450,8 @@ class Agent:
             if self.trace_enabled:
                 summary = f"{elapsed:.2f}s / {len(output)} 字符"
                 TRACE_ENGINE.finish(summary) if ok else TRACE_ENGINE.fail(f"失败 | {output.splitlines()[0][:80] if output else ''}")
-            # 下面几种只是换个画法，发给模型的 output 原样不动
-            drawn = False
-            if ok and todo_tool and output.startswith(("Task list updated:", "Marked complete.")):
-                finishing = builtin is complete_todo and not was_all_done and all(it.get("done") for it in TODOS.items)
-                index = args.get("index") if isinstance(args.get("index"), int) else None
-                drawn = view.todo_progress(TODOS.items, flash=finishing,
-                                           compact=builtin is complete_todo and not finishing, just_done=index)
-            elif ok and builtin is remember and getattr(self, "show_recall", SHOW_RECALL):
-                mid = re.search(r"#(\d+)", output)
-                item = MEMORY.get(int(mid.group(1))) if mid else None
-                drawn = view.remembered((item or {}).get("content") or str(args.get("content", "")), as_result=True)
-            if not drawn:
-                view.tool_result(output, ok)
+            # 先把结果记进历史，再往屏幕上画。画的时候可能有动画（任务做完会闪一下），
+            # 这时按 Ctrl+C，历史里也已经是工具真实的结果，而不是一句「没执行完」
             dangerous, mutating = self._tool_flags(name)
             MOOD.record_tool(
                 name,
@@ -5423,6 +5469,19 @@ class Agent:
                 }
             )
             self._trim_messages()
+            # 下面几种只是换个画法，发给模型的 output 原样不动
+            drawn = False
+            if ok and todo_tool and output.startswith(("Task list updated:", "Marked complete.")):
+                finishing = builtin is complete_todo and not was_all_done and all(it.get("done") for it in TODOS.items)
+                index = args.get("index") if isinstance(args.get("index"), int) else None
+                drawn = view.todo_progress(TODOS.items, flash=finishing,
+                                           compact=builtin is complete_todo and not finishing, just_done=index)
+            elif ok and builtin is remember and getattr(self, "show_recall", SHOW_RECALL):
+                mid = re.search(r"#(\d+)", output)
+                item = MEMORY.get(int(mid.group(1))) if mid else None
+                drawn = view.remembered((item or {}).get("content") or str(args.get("content", "")), as_result=True)
+            if not drawn:
+                view.tool_result(output, ok)
     def _mcp_lookup(self, name: str) -> tuple[Any, str, dict] | None:
         """把对外暴露的工具名映射回 (服务器, 原始工具名, 工具定义)。"""
         mcp_srv = self._mcp_tool_map.get(name)
@@ -6559,7 +6618,7 @@ def run_self_tests() -> str:
             one_hue = codes <= {111, 153, 189} and not any(re.search(r"\x1b\[3[0-7]m", f) for f in frames)
             faint_dim = "\x1b[2m" in frames[0].split("测")[0]
             globals()["_term_width"] = lambda: 24
-            narrow = _visible_width(Spinner("揉揉眼睛，再看一遍").frame(0, 12)) <= 24
+            narrow = _visible_width(Spinner("有点累，慢慢来，再想想").frame(0, 12)) <= 24
         finally:
             globals()["_COLOR"], globals()["_term_width"] = saved_color, saved_width
         state = dict(_MOOD_BASELINE)
@@ -6582,7 +6641,7 @@ def run_self_tests() -> str:
         finally:
             sys.stdout = real_stdout
         verbs_ok = (labels[0][0] in Spinner.VERBS and labels[0][0] == labels[1][0]
-                    and labels[2] == ("揉揉眼睛，再看一遍", 0.14) and labels[3][0] == "换个思路"
+                    and labels[2] == ("有点累，慢慢来", 0.14) and labels[3][0] == "有点受挫，接着找"
                     and explicit and not drew.strip())
         late = datetime.datetime(2026, 1, 1, 23, 30)
         def line(**kw):
@@ -6719,11 +6778,19 @@ def run_self_tests() -> str:
         vertical = len(vrows) == 12 and "━" not in "".join(vrows) and all(_display_width(r) <= 30 for r in vrows)
         finished = [dict(t, done=True) for t in three]
         no_time = "\n".join(plain(render_constellation(finished, 60)))
-        start = _now_dt()
-        timed = [dict(t, created_at=_iso(start), done_at=_iso(start + datetime.timedelta(minutes=10))) for t in finished]
-        with_time = "\n".join(plain(render_constellation(timed, 60)))
+        start = datetime.datetime.now().astimezone().replace(microsecond=0)
+        def stamped(begin, end):
+            return [dict(t, created_at=begin.isoformat(), done_at=end.isoformat()) for t in finished]
+        with_time = "\n".join(plain(render_constellation(stamped(start, start + datetime.timedelta(minutes=10)), 60)))
+        naive = "\n".join(plain(render_constellation(stamped(start.replace(tzinfo=None), start.replace(tzinfo=None)), 60)))
+        backwards = "\n".join(plain(render_constellation(stamped(start, start - datetime.timedelta(minutes=20)), 60)))
+        long_took = plain(render_constellation(stamped(start, start + datetime.timedelta(hours=11, minutes=59)), 30))
         done_ok = ("✧ 完成" in no_time and "✓ 全部完成 · 3 步" in no_time and "用时" not in no_time
-                   and "用时 10 分钟" in with_time)
+                   and "用时 10 分钟" in with_time
+                   and "用时" not in naive and "用时" not in backwards           # 没时区、倒着走的时间都不报
+                   and all(_display_width(r) <= 30 for r in long_took))      # 窄的时候整段「用时」宁可不要
+        compact_row = plain(render_constellation(three, 75, compact=True, just_done=1))[0]
+        compact_ok = compact_row.strip().startswith("✦┄┄┄✧┄┄┄✧")  # 一行版不标「当前」，做完的才是 ✦
         plan_rows = "\n".join(plain(render_constellation([{"text": s, "done": False} for s in ("a", "b")], 40, show_current=False)))
         plan_ok = "正在做" not in plan_rows and "✦" not in plan_rows
         with tempfile.TemporaryDirectory() as tmp:
@@ -6772,13 +6839,119 @@ def run_self_tests() -> str:
             MOOD.state.clear()
             MOOD.state.update(saved_mood)
             MOOD._save()
-        ok = horizontal and vertical and done_ok and plan_ok and stamps_ok and inline_ok and piped_ok and missing_ok and flash_ok
+        ok = horizontal and vertical and done_ok and compact_ok and plan_ok and stamps_ok and inline_ok and piped_ok and missing_ok and flash_ok
         checks.append(("constellation_progress", ok,
                        f"横排 {'OK' if horizontal else 'FAIL'}｜竖排兜底 {'OK' if vertical else 'FAIL'}｜"
-                       f"用时不编 {'OK' if done_ok else 'FAIL'}｜发给模型的不变 {'OK' if inline_ok else 'FAIL'}｜"
+                       f"用时不编 {'OK' if done_ok else 'FAIL'}｜一行版 {'OK' if compact_ok else 'FAIL'}｜发给模型的不变 {'OK' if inline_ok else 'FAIL'}｜"
                        f"管道原样 {'OK' if piped_ok else 'FAIL'}｜闪完终屏一致 {'OK' if flash_ok else 'FAIL'}"))
     except Exception as e:
         checks.append(("constellation_progress", False, str(e)))
+    try:
+        # 审查找出来的问题，一条一个回归检查：以后谁改回去，这里会先叫
+        results = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            arch = ConversationArchive(os.path.join(tmp, "c.jsonl"))
+            arch.session_id = "old"
+            arch.append("user", "客户张三的合同金额怎么报税")
+            mem = _aged_memory(tmp, [("带时区的记忆", "fact", 1.5, 1, False)])
+            mem.items[0]["last_review"] = "2026-01-01T08:00:00Z"   # 手改/同步来的带时区时间
+            fixed = _now_dt()
+            _, shared = render_startup(startup_agent, 80, memory=mem, archive=arch, now=fixed, tty=True, sky=False)
+            shared = _ANSI_RE.sub("", "\n".join(shared))
+            results["关掉星空不报话题"] = "张三" not in shared and "又见面了" in shared
+            init = ConversationArchive(os.path.join(tmp, "i.jsonl"))
+            init.append("user", INIT_PROMPT)
+            results["没有 AGENT.md 不说初始化了"] = "初始化了" not in _last_session_greeting(init._read_all(), fixed)
+            try:
+                render_startup(startup_agent, 80, memory=mem, archive=arch, now=fixed, tty=True, sky=True)
+                results["带时区的时间戳不崩"] = True
+            except Exception:
+                results["带时区的时间戳不崩"] = False
+        # 心情行的步数：和真正跑循环时走同一个 REASON.budget_for，环境里文件多少、待办多少都算进去
+        steps_ok = True
+        for fatigue in (70, 84):
+            probe_mood = MoodState.__new__(MoodState)
+            probe_mood.state = dict(_MOOD_BASELINE, fatigue=fatigue)
+            probe_mood.rebalance(0.05)
+            base = MoodState.__new__(MoodState)
+            base.state = dict(_MOOD_BASELINE)
+            cap, calm = min(20, REASON.budget_for(probe_mood)), min(20, REASON.budget_for(base))
+            said = _ANSI_RE.sub("", _mood_line(startup_agent, 100, state=dict(_MOOD_BASELINE, fatigue=fatigue)))
+            steps_ok &= (f"收到 {cap} 步（平时 {calm}）" in said) if cap < calm else ("步" not in said.split("，")[1] if "，" in said else True)
+        results["步数和循环一致"] = steps_ok
+        # system 模式：一次拼提示词只拼一次运行时上下文（拼两次会让闪回拿到复习之后的满格）
+        saved_pos = globals()["CONTEXT_POSITION"]
+        try:
+            globals()["CONTEXT_POSITION"] = "system"
+            p = Agent.__new__(Agent)
+            p.system_base, p.instructions, p.model, p._native_reasoning_seen = "b", "", "m", False
+            p._system_prompt_cache_key, p._system_prompt_cache, p.reload_instructions = "", "", lambda: ""
+            calls = []
+            p._runtime_context_note = lambda: calls.append(1) or "note"
+            prompt = p._system_prompt()
+            results["system 模式只拼一次"] = len(calls) == 1 and prompt.endswith("note")
+        finally:
+            globals()["CONTEXT_POSITION"] = saved_pos
+        # 宽度：✎ 那行、闪回、开屏统计、窄终端里的动画，都不许比给的宽度宽
+        wbuf = io.StringIO()
+        wide = StreamView(render=False, animate=False, out=wbuf, width=79)
+        wide.remembered("这是一条很长很长的记忆" * 6, as_result=True)
+        wide.remembered("这是一条很长很长的教训" * 6, label="记下一条教训")
+        rbuf = io.StringIO()
+        StreamView(render=False, animate=False, out=rbuf, width=24).recall(
+            [{"id": 1, "content": "很长的一条记忆内容", "retention": 0.5, "last_review": _iso(_now_dt() - datetime.timedelta(hours=23))}])
+        saved_size = shutil.get_terminal_size
+        try:
+            shutil.get_terminal_size = lambda fallback=(80, 24): os.terminal_size((16, 24))
+            tiny = _visible_width(Spinner("有点累，慢慢来").frame(0, 3)) <= 15
+        finally:
+            shutil.get_terminal_size = saved_size
+        rows = [l for buf in (wbuf, rbuf) for l in _ANSI_RE.sub("", buf.getvalue()).splitlines() if l]
+        results["不超宽"] = (all(_display_width(l) <= 79 for l in rows[:2]) and all(_display_width(l) <= 24 for l in rows[2:])
+                           and _visible_width(_sky_summary({"total": 1400, "vivid": 30, "steady": 30, "fading": 130, "dormant": 1200}, 60)) <= 60
+                           and tiny)
+        # 任务做完闪的那半秒按 Ctrl+C：历史里得是工具真实的结果，剩下的行也要画完、光标要还回来
+        class _Interrupting(StreamView):
+            def _write(self, text: str) -> None:
+                if text.startswith("\r") and not getattr(self, "fired", False):
+                    self.fired = True
+                    raise KeyboardInterrupt
+                super()._write(text)
+        saved_todos = [dict(it) for it in TODOS.items]
+        saved_mood = json.loads(json.dumps(MOOD.state))
+        try:
+            TODOS.set(["只有一项"])
+            p = Agent.__new__(Agent)
+            p.tools, p.mcp_servers, p._mcp_tool_map, p.mode, p.quiet, p.tag = {"complete_todo": complete_todo}, {}, {}, "auto", True, ""
+            p.trace_enabled, p.messages, p.model, p.max_context_messages, p.max_context_tokens = False, [], "m", 40, MAX_CONTEXT_TOKENS
+            ibuf = io.StringIO()
+            p._stream_view = _Interrupting(render=True, animate=True, width=60, out=ibuf)
+            saved_flash, StreamView.FLASH_INTERVAL = StreamView.FLASH_INTERVAL, 0
+            try:
+                p._run_tools_and_feed_back({"tool_calls": [{"id": "k", "type": "function",
+                                                            "function": {"name": "complete_todo", "arguments": '{"index": 1}'}}]})
+                interrupted = False
+            except KeyboardInterrupt:
+                interrupted = True
+            finally:
+                StreamView.FLASH_INTERVAL = saved_flash
+            results["闪的时候打断不丢结果"] = (interrupted and p.messages and p.messages[-1]["content"].startswith("Marked complete.")
+                                         and ibuf.getvalue().endswith("\x1b[?25h") and "全部完成" in ibuf.getvalue())
+        finally:
+            TODOS.items = saved_todos
+            TODOS.persist()
+            MOOD.state.clear()
+            MOOD.state.update(saved_mood)
+            MOOD._save()
+        vbuf = io.StringIO()
+        StreamView(render=True, animate=True, width=40, out=vbuf).todo_progress(
+            [{"text": f"第{i}步", "done": True} for i in range(12)], flash=True)
+        results["竖排不闪第一项"] = "\r" not in vbuf.getvalue()
+        ok = all(results.values())
+        failed = [k for k, v in results.items() if not v]
+        checks.append(("ui_review_regressions", ok, f"{sum(results.values())}/{len(results)}" + (f"｜没过：{'、'.join(failed)}" if failed else "")))
+    except Exception as e:
+        checks.append(("ui_review_regressions", False, str(e)))
     try:
         lines = []
         for name, passed, detail in checks:
@@ -6878,7 +7051,8 @@ def handle_cli_command(agent: Agent, user_input: str) -> tuple[bool, str | None]
         return True, None
     if command == "mood":
         print(_mood_line(agent, _term_width()))
-        print(MOOD.render())
+        # 「状态：超清醒」那行去掉：label() 不看疲劳，会和上面「有点累了」自相矛盾
+        print("\n".join(line for line in MOOD.render().splitlines() if not line.startswith("状态：")))
         return True, None
     if command == "flashback":
         if args and args[0] in {"on", "off"}:
@@ -7400,12 +7574,15 @@ def _greeting_period(hour: int) -> str:
     if 18 <= hour < 23:
         return "晚上好"
     return "夜深了"
-def _last_session_greeting(records: list[dict], now: datetime.datetime) -> str:
+def _last_session_greeting(records: list[dict], now: datetime.datetime, *, topic: bool = True) -> str:
     """问候：几点了 + 上次聊到哪儿。话题取上一次会话里用户说的第一句话——那句最能说明来意。
-    （ExperienceModel 的关键词是按中文二元组切的，会切出「们在」「在聊」这种碎片，不能拿来当话题。）"""
+    （ExperienceModel 的关键词是按中文二元组切的，会切出「们在」「在聊」这种碎片，不能拿来当话题。）
+    topic=False 时不提上次聊了什么：POLARIS_SKY=0 是给共享屏幕用的，话题和记忆片段一样不该上屏。"""
     period = _greeting_period(now.hour)
     if not records:
         return f"{period}，初次见面——我是 Polaris。"
+    if not topic:
+        return f"{period}，又见面了。"
     try:
         sid = str(records[-1].get("session_id") or "")
         session = [r for r in records if str(r.get("session_id") or "") == sid]
@@ -7416,7 +7593,9 @@ def _last_session_greeting(records: list[dict], now: datetime.datetime) -> str:
         last_time = _parse_dt(session[-1].get("time"), now)
         days = (now.date() - last_time.date()).days
         when = "今天早些时候" if days <= 0 else "昨天" if days == 1 else f"{days} 天前"
-        if asks[0] == _clean_line(INIT_PROMPT):
+        # /init 的那句话是程序替用户说的。只有 AGENT.md 真的在，才说「一起初始化了」——
+        # 那一轮可能因为连不上模型、被 Ctrl+C、或者处在 plan 模式而什么都没写成
+        if asks[0] == _clean_line(INIT_PROMPT) and os.path.exists("AGENT.md"):
             return f"{period}。{when}我们一起初始化了 AGENT.md。"
         return f"{period}。上次我们在聊「{_fit_display(asks[0], 20)}」，{when}。"
     except Exception:
@@ -7431,9 +7610,12 @@ def _mood_line(agent: Any, width: int, *, now: datetime.datetime | None = None, 
     probe.state = dict(s)
     probe.rebalance(0.05)
     p = probe.state
+    baseline = MoodState.__new__(MoodState)
+    baseline.state = dict(_MOOD_BASELINE)
+    # 步数和真正跑循环时一样算：心情给的预算，再加上工作区、待办带来的风险修正
     max_steps = getattr(agent, "max_steps", 20)
-    calm = min(max_steps, 18)
-    cap = min(max_steps, probe.turn_budget())
+    calm = min(max_steps, REASON.budget_for(baseline))
+    cap = min(max_steps, REASON.budget_for(probe))
     bright = False
     if s["frustration"] >= 35:
         phrase = "上回不太顺，还有点惦记"
@@ -7458,14 +7640,19 @@ def _mood_line(agent: Any, width: int, *, now: datetime.datetime | None = None, 
         phrase = "状态平稳"
     icon = "✧" if bright else "☀" if 6 <= now.hour < 18 else "☾"
     return paint("  " + icon, "accent") + " " + paint(_fit_display(phrase, max(8, width - 4)), "dim")
-def _sky_summary(stats: dict) -> str:
+def _sky_summary(stats: dict, width: int = 100) -> str:
     if not stats.get("total"):
-        return paint("  还没有记忆，聊着聊着星星就多了", "dim")
+        return paint("  " + _fit_display("还没有记忆，聊着聊着星星就多了", width - 2), "dim")
     # 数字和 /memstat 同出一源（curve_stats），开屏和 /memstat 永远对得上
     parts = [(stats["vivid"], "颗亮着", "shine"), (stats.get("steady", 0), "颗微光", "accent"),
              (stats["fading"], "颗在变暗", "accent"), (stats["dormant"], "颗已沉睡", "dim")]
     shown = [paint(str(n), style) + paint(f" {word}", "dim") for i, (n, word, style) in enumerate(parts) if n or i == 0]
-    return paint("  记忆星空 · ", "dim") + paint(" · ", "dim").join(shown)
+    line = paint("  记忆星空 · ", "dim") + paint(" · ", "dim").join(shown)
+    # 放不下就从最次要的那段开始丢，宁可少说一项，也不让这一行折到下一行
+    while _visible_width(line) > width and len(shown) > 1:
+        shown.pop()
+        line = paint("  记忆星空 · ", "dim") + paint(" · ", "dim").join(shown)
+    return line
 def _banner_command_grid() -> list[str]:
     out = []
     half = (len(BANNER_COMMANDS) + 1) // 2
@@ -7491,19 +7678,21 @@ def render_startup(agent: Any, width: int, *, memory: "Memory | None" = None, ar
         records = archive._read_all()
     except Exception:
         records = []
-    greeting = "  " + _fit_display(_last_session_greeting(records, now), width - 2)
+    greeting = "  " + _fit_display(_last_session_greeting(records, now, topic=sky), width - 2)
     mood = _mood_line(agent, width, now=now)
-    if not tty or not sky or width < 50:
+    if not tty or not sky or width < 60:
         # 不是终端（管道、CI）或者太窄：还是原来那个开屏，外加问候和心情。
-        # 窄终端放不下 58 格宽的框，只留一行标题
+        # 窄终端放不下 58 格宽的框和命令表，只留一行标题
         head = render_banner().splitlines() if width >= 60 or not tty else [paint("  ✦ Polaris", "accent", "bold") + paint(f" v{VERSION}", "dim")]
         return None, head + ["", greeting, mood, ""] + _startup_status(agent, width)
     sky_width = min(width, 72)
     cells = _sky_cells(list(memory.items), sky_width - 2, now, memory=memory)
-    lines = ["", _sky_summary(memory.curve_stats(now)), "", greeting, mood, ""]
+    lines = ["", _sky_summary(memory.curve_stats(now), width), "", greeting, mood, ""]
     if records:
         hint = (paint("/help", "accent") + paint(" 全部命令 · ", "dim") + paint("/memstat", "accent")
                 + paint(" 看哪些记忆在变暗 · ", "dim") + paint("exit", "accent") + paint(" 退出", "dim"))
+        if _visible_width(hint) + 2 > width:
+            hint = paint("/help", "accent") + paint(" 全部命令 · ", "dim") + paint("exit", "accent") + paint(" 退出", "dim")
         lines.append("  " + hint)
     else:
         lines += _banner_command_grid()  # 第一次来：把最常用的几条命令摆出来
@@ -7520,7 +7709,11 @@ def main():
     agent = Agent(tools=BUILTIN_TOOLS)
     # 旧版在这里一口气打印 11 行内部状态，人格那行 150 格宽，窄终端上直接折成一团。
     # 现在压成两行摘要，完整信息本来就有 /state、/doctor、/persona 可以看。
-    cells, lines = render_startup(agent, _term_width())
+    try:
+        cells, lines = render_startup(agent, _term_width())
+    except Exception:
+        # 开屏只是门面：状态文件里有什么怪东西，也不能让程序在提示符出来之前就崩掉
+        cells, lines = None, render_banner().splitlines() + [""] + _startup_status(agent, _term_width())
     if cells is not None:
         if _ANIMATE:
             _twinkle_in(cells)
