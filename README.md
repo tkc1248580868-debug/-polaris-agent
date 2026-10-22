@@ -6,7 +6,7 @@
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Dependencies](https://img.shields.io/badge/dependencies-1-brightgreen)
-![Single file](https://img.shields.io/badge/single--file-6.6k%20lines-orange)
+![Single file](https://img.shields.io/badge/single--file-7.6k%20lines-orange)
 ![Version](https://img.shields.io/badge/version-1.1.6-lightgrey)
 
 An open-source autonomous AI agent with a persistent personality, long-term
@@ -50,7 +50,7 @@ python polaris_1_1_6_memorycurve.py --selftest    # exits non-zero if anything f
 
 or `/selftest` from inside a session.
 
-Thirty-four checks covering the sandbox, the shell guard, file-edit safety,
+Thirty-eight checks covering the sandbox, the shell guard, file-edit safety,
 context assembly, the trace tree, the memory curve, and the terminal UI. No API
 key required.
 
@@ -86,9 +86,9 @@ with no API key and no network.
 
 ### An inner life that is wired into control flow
 
-Mood is not decoration. High fatigue shrinks the step budget; high frustration
-triggers delegation to sub-agents. Persona, relationship, and mood shape the
-prompt on every turn — and all three persist across sessions.
+Mood is not decoration. High fatigue shrinks the step budget; a run of failures
+buys extra steps to debug with. Persona, relationship, and mood shape the prompt
+on every turn — and all three persist across sessions.
 
 ### A visible reasoning trail
 
@@ -103,9 +103,20 @@ stream in as rendered Markdown instead of raw `**` and `##`, and its thinking is
 set apart in dim italics. Plain ANSI codes, no UI library; piped output stays
 plain text.
 
+The screen also shows the inner state the rest of this README describes:
+
+- **A sky of your memories at startup.** Every star is one memory, as bright as
+  it is still remembered on the forgetting curve. Same memories, same sky.
+- **Memory flashback.** Before it answers, it shows which memories it just
+  recalled and how clear each one was *before* recalling it strengthened it.
+- **A spinner with a mood.** Tired, it dims and slows down — at the same
+  threshold where the step budget really shrinks.
+- **Plans as constellations.** Each step is a star that lights up when it is
+  done.
+
 ### One file, one dependency
 
-6,600 lines of Python, no framework, no vector database, no build step. Copy it
+7,600 lines of Python, no framework, no vector database, no build step. Copy it
 anywhere and run it.
 
 ---
@@ -128,7 +139,7 @@ anywhere and run it.
 | **MCP + Plugins** | Model Context Protocol over stdio; drop-in `plugins/*.py` |
 | **Safety** | Python sandbox, shell guard, file checkpoints, permission modes |
 
-35 built-in tools. 46 slash commands.
+35 built-in tools. 47 slash commands.
 
 ---
 

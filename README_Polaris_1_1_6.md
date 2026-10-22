@@ -165,7 +165,7 @@ file edit.
 
 ### Self-tests
 
-`/selftest` runs a thirty-four-check suite covering JSON parsing, context building,
+`/selftest` runs a thirty-eight-check suite covering JSON parsing, context building,
 snapshot round-trip, calculator sandbox escapes, shell guard rules, context
 starvation, step-budget direction, trace wiring, sub-agent isolation, tool
 description coverage, and three memory checks — curve direction and the spacing
@@ -175,8 +175,8 @@ gate, the embedding timeout, file paging, shell exit-code reporting, streaming
 tool-call assembly, whether the chain of thought is actually causal, the
 file-editing safety rules, and the terminal UI — Markdown rendering, live redraw
 matching the line-by-line layout exactly, the spinner leaving no trace, thinking
-kept apart from the answer, and `exit` / Ctrl+C / the startup gate. No API key
-required.
+kept apart from the answer, and `exit` / Ctrl+C / the startup gate — plus one
+check for each of the four views below. No API key required.
 
 It runs in CI too. `python polaris_1_1_6_memorycurve.py --selftest` exits non-zero
 if any check fails, and GitHub Actions runs it on every push across Python
@@ -408,6 +408,62 @@ the same stream through the animated path and the line-by-line path, replays
 both through a minimal terminal emulator, and requires the final screens to be
 identical. Miscount the rows of one redraw and the check fails.
 
+### Four views of its inner state
+
+Polaris has a forgetting curve, a mood and a plan, but until now none of them
+were visible unless you typed a command. Four small views put them on screen.
+Each one only reads state it already had — none of them changes what is sent to
+the model.
+
+**The memory sky (startup).** Every long-term memory is a star; its brightness
+is its retention right now (✦ vivid, ✧ in between, ⋆ fading; dormant memories
+are not drawn). Positions come from a hash of the memory id, so the same
+memories give the same sky every time. The brightest few carry a label. The
+counts underneath come from the same function as `/memstat`, so the two never
+disagree. Then a greeting with the time of day and what the last session was
+about (its first message), and a mood line. Drawing the sky never recalls a
+memory: recall strengthens memories, so a startup screen that recalled them
+would change the very thing it shows. `POLARIS_SKY=0` restores the plain
+banner, for screen-sharing.
+
+```
+        ✦ 用户看不懂英…          ⋅            ✧
+   ⋅              ✦ Polaris        ⋆
+  记忆星空 · 5 颗亮着 · 2 颗微光 · 2 颗在变暗 · 1 颗已沉睡
+
+  晚上好。上次我们在聊「主界面是不是有点简陋」，3 天前。
+  ✧ 最近挺顺手
+```
+
+**Memory flashback.** Before the answer, the memories that actually went into
+this turn's context, with how clear each was *before* this recall reinforced
+it — afterwards every bar would read full. Memories cut off by the context
+budget are not listed, nor is the "three most recent" fallback used for
+inputs too short to search on, because neither was recalled. Once per turn.
+Writing a memory shows `✎ 记住了` instead of the raw tool result. `/flashback
+off` or `POLARIS_SHOW_RECALL=0` turns it off.
+
+```
+◌ 想起 4 件事
+  · 用户看不懂英文，回复一律用中文   ▰▰▰▰▱ 2 天前
+  · README 里的数字上次刚对齐过     ▰▰▰▱▱ 20 小时前
+    … 还有 1 件
+```
+
+**A spinner with a mood.** Frustrated (≥35), the shimmer runs twice as fast
+and the label says 换个思路. Tired (fatigue ≥60, the line where the step
+budget really drops), it dims and breathes slower. The startup mood line only
+states what the code does: a smaller or larger step budget, and the advice the
+model is given. Nothing splits tasks or delegates because of mood, so it never
+says so.
+
+**Plans as constellations.** `set_todos`, `complete_todo`, `/todo` and `/plan`
+draw the list as stars — done ✦ joined by ━, the current one brightest, the
+rest ✧ joined by ┄ — falling back to a vertical list when it does not fit. The
+last tick makes the line flash once and adds `✓ 全部完成 · N 步 · 用时 X`. The
+duration comes from per-item timestamps that new lists now record; older lists
+have none, so no duration is shown rather than a guessed one.
+
 The startup gate — a model call at launch that decides whether Polaris should
 start at all, and can refuse — is now **off by default**. It cost a call and a
 few seconds on every launch to second-guess someone who had just typed the
@@ -487,6 +543,7 @@ Every file write is checkpointed first — `/undo` restores the previous version
 |---|---|
 | `/memory [n]` · `/remember [-c category] <text>` · `/forget <id>` | Long-term memory, with each entry's retention and half-life |
 | `/searchmem <query>` | Search memory |
+| `/flashback [on\|off]` | Show which memories each turn recalled |
 | `/recall <query> [n]` | Vector recall with per-hit semantic / keyword / retention scores |
 | `/memstat` | Forgetting-curve report: vivid, fading, dormant |
 | `/pin <id>` · `/unpin <id>` · `/revive <id>` | Exempt from decay; resume decay; wake a dormant memory |
@@ -529,6 +586,8 @@ Every file write is checkpointed first — `/undo` restores the previous version
 | `POLARIS_MAX_CONTEXT_TOKENS` | `32000` | Token budget for the conversation history. Lower it for small local models. |
 | `POLARIS_COLOR` | auto | `1`/`0` to force colour on or off. Off automatically when not a TTY. `NO_COLOR` is honoured. |
 | `POLARIS_ANIMATE` | `true` | Spinner and live Markdown redraw. `0` keeps the formatting but never moves the cursor. Off automatically when not a TTY. |
+| `POLARIS_SKY` | `true` | The memory-sky startup screen. `0` shows the plain banner — the sky prints memory snippets and the last topic. |
+| `POLARIS_SHOW_RECALL` | `true` | Show which memories each turn recalled. Also `/flashback on\|off` in a session. |
 | `POLARIS_SHELL_ALLOW_DANGEROUS` | `false` | Lift the destructive-command block. |
 | `MINIAGENT_PLUGIN_DIRS` | `plugins` | Comma-separated plugin directories. |
 | `POLARIS_EMBED_BACKEND` | `auto` | `auto` · `remote` · `local`. `auto` uses the remote model when an endpoint is configured, else the local hash embedder. |
@@ -577,7 +636,7 @@ injecting both into the system prompt. `/init` generates a starter file.
 ## Architecture
 
 ```
-main()  ── CLI loop, 46 slash commands
+main()  ── CLI loop, 47 slash commands
   │
   └── Agent.chat()
         ├── MoodState.begin_turn()        emotional state entering the turn
