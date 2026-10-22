@@ -7445,8 +7445,12 @@ def _startup_status(agent: Agent, width: int, *, with_memory: bool = True) -> li
     bits.append(f"工具 {agent.tool_profile}({tool_profile_cost(agent.tool_profile)[0]})")
     state = [f"记忆 {len(MEMORY.items)} 条"] if with_memory else []
     state += [f"信任 {RELATIONSHIP.state.get('trust', 0)}", f"文件 {len(WORKSPACE.file_index)} 个"]
-    if WORKSPACE.recent_files:
-        state.append(f"最近改动 {Path(WORKSPACE.recent_files[0]['path']).name}")
+    # 「最近改动」要说用户的文件：Polaris 自己的状态文件每回合都在写，排在最前面毫无意义
+    own = {Path(f).name for f in (MEMORY_FILE, MEMORY_VECTOR_FILE, MOOD_FILE, CONVERSATION_FILE, TODO_FILE,
+                                  PERSONA_FILE, RELATIONSHIP_FILE)}
+    recent = next((Path(f["path"]).name for f in WORKSPACE.recent_files if Path(f["path"]).name not in own), "")
+    if recent:
+        state.append(f"最近改动 {recent}")
     lines = [" · ".join(bits), " · ".join(state)]
     extras = []
     if agent.instructions:
@@ -7518,7 +7522,7 @@ def _sky_cells(items: list[dict], width: int, now: datetime.datetime, *, memory:
     for item, retention, tier, row, col in sorted(placed, key=lambda p: -p[1])[:4]:
         if tier != "vivid":
             continue
-        label = _fit_display(_clean_line(item.get("content", "")), 14)
+        label = _fit_display(_clean_line(item.get("content", "")), 18)
         cells = []
         for ch in label:
             cells.append(ch)
